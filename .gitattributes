@@ -1,0 +1,33 @@
+# 仓库内统一按 LF 存储与检出，避免 Windows 的 CRLF 造成 diff 抖动和无意义的整文件改动。
+# 本机 core.autocrlf=true 时若不声明，每次 git 都会提示 "LF will be replaced by CRLF"。
+* text=auto eol=lf
+
+# 文本类型显式声明（便于别人用 core.autocrlf=false 时也一致）
+*.js    text eol=lf
+*.mjs   text eol=lf
+*.cjs   text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+
+# Windows 脚本必须保留 CRLF，否则部分解释器会出错（写在后面，覆盖上面的 * 规则）
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# 二进制文件：不转换换行、不做文本 diff
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.ico   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+
+# 锁文件是生成物：折叠 diff，且不计入语言统计
+pnpm-lock.yaml    -diff linguist-generated
+package-lock.json -diff linguist-generated
+yarn.lock         -diff linguist-generated
