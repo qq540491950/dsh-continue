@@ -109,5 +109,5 @@ npm run verify       # = npm run build + node tools/verify.mjs
 | 继续按钮只认「最新一轮」 | 读的是 Chat target 快照的 `timeline`（`turn.end.data.reason.kind`），与官方判「停止/失败的一轮」用的是同一个字段。 |
 | 订阅 Chat target 有成本 | 为了读最新一轮的结束原因，座位会订阅 Chat 快照；即使你切到 Trajectory 视图，Chat target 也会保持激活。这是拿一点内存换「不看视图也能正确判断」。 |
 | 输出被截断（max-tokens）也算「该继续」 | 官方在那里的提示就是让用户发「继续」，所以本插件一并接管。不想要就把它从 `RESUME_REASONS` 里删掉。 |
-| 界面没有实测过 | 本机没有浏览器控制能力，只验证了包清单、真跑 factory / apply 的协议断言、迷你渲染器下的行为断言，以及**活台账**里的座位注册。**视觉效果（颜色、位置、悬停）未经人眼确认。** |
+| 界面没有实测过 | 本机没有浏览器控制能力，只验证了包清单、真跑 factory / apply 的协议断言、迷你渲染器下的行为断言，以及**活台账**里的座位注册（`conversation.input.activity` 的 `occupants` 里能看到 `priority: -1` 的本插件条目）。**视觉效果（颜色、位置、悬停）与人眼点击未经确认。** |
 | 不注册快捷键 | 只改按钮，不加键盘手势。 |
