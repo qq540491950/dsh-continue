@@ -6,6 +6,7 @@
  * （AGENTS.md 2.4）。所以先编译到 `.build/`，校验通过后再**临时文件 + 原子替换**进 `lib/`。
  *
  * 用法：`npm run build`（`npm run verify` 会先跑一遍这个）。
+ * 本文件由 Node 直接执行（原生类型剥离，不需要编译）：`node tools/build.ts`。
  */
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -16,8 +17,17 @@ const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const OUT = path.join(ROOT, ".build");
 const TSC = path.join(ROOT, "node_modules", "typescript", "bin", "tsc");
 
-/** 每个产物的投递契约检查：不过就不许写进 `lib/`。 */
-const ARTIFACTS = [
+/** 一条投递契约检查：`[说明, 判定函数]`。 */
+type ArtifactCheck = [label: string, check: (text: string) => boolean];
+
+/** 一个产物的落地契约：不过就不许写进 `lib/`。 */
+interface Artifact {
+	file: string;
+	description: string;
+	checks: ArtifactCheck[];
+}
+
+const ARTIFACTS: Artifact[] = [
 	{
 		file: "client.js",
 		description: "浏览器半边（必须是 classic script）",
@@ -39,7 +49,7 @@ const ARTIFACTS = [
 ];
 
 /** 先编译到 `.build/`：任何类型错误都在这一步失败，`lib/` 一个字节都不动。 */
-function compile() {
+function compile(): void {
 	if (fs.existsSync(TSC) === false) {
 		console.error(`找不到 TypeScript：${TSC}`);
 		console.error("先装依赖：npm install");
@@ -49,15 +59,20 @@ function compile() {
 		cwd: ROOT,
 		stdio: "inherit",
 	});
-	if (result.status !== 0) {
+	if (statusOf(result.status) !== 0) {
 		console.error("");
 		console.error("编译失败：lib/ 保持原样（不会写半截文件）。");
-		process.exit(result.status ?? 1);
+		process.exit(statusOf(result.status));
 	}
 }
 
+/** `spawnSync` 的 status 可能是 null（被信号杀掉），统一成退出码。 */
+function statusOf(status: number | null): number {
+	return status === null ? 1 : status;
+}
+
 /** 原子替换：同目录临时文件 → rename，读者要么看到旧内容，要么看到新内容。 */
-function writeAtomic(target, content) {
+function writeAtomic(target: string, content: string): void {
 	const temp = `${target}.${process.pid}.tmp`;
 	fs.writeFileSync(temp, content, "utf8");
 	fs.renameSync(temp, target);
@@ -65,7 +80,7 @@ function writeAtomic(target, content) {
 
 compile();
 
-const failures = [];
+const failures: string[] = [];
 for (const artifact of ARTIFACTS) {
 	const source = path.join(OUT, artifact.file);
 	if (fs.existsSync(source) === false) {

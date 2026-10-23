@@ -87,15 +87,20 @@ profile 的 `package.json` 依赖与 `dsh.profile.bundles`，卸载时随依赖�
 ## 4. 开发与自检
 
 ```powershell
-npm install          # 只装 typescript（devDependency）
-npm run verify       # = npm run build + node tools/verify.mjs
+npm install          # 只装 devDependency：typescript + @types/node
+npm run check        # = typecheck（src + tools）+ build + verify
 ```
 
-- `npm run build`：`src/*.ts` → `tsc` → `.build/` → 校验投递契约 → **临时文件 + 原子替换**
-  进 `lib/*.js`（`dsh-client-hmr` 读到半截文件会让插件彻底消失，所以不许就地写）。
-- `node tools/verify.mjs` 是**纯 Node、零依赖**的离线自检：用 `node:vm` 跑**真实的**
+- **全部源码都是 TypeScript**：`src/*.ts`（插件本体）与 `tools/*.ts`（构建 / 自检 / asar 工具）。
+  工具脚本由 Node **原生类型剥离**直接执行（`node tools/build.ts`、`node tools/verify.ts`），
+  不需要 ts-node / esbuild；`tsconfig.tools.json` 用 `erasableSyntaxOnly` 守住这条。
+- `npm run build`（`tools/build.ts`）：`src/*.ts` → `tsc` → `.build/` → 校验投递契约 →
+  **临时文件 + 原子替换**进 `lib/*.js`（`dsh-client-hmr` 读到半截文件会让插件彻底消失，
+  所以不许就地写）。
+- `npm run typecheck`：`tsc -p tsconfig.json --noEmit`（`src/`）+ `tsc -p tsconfig.tools.json`（`tools/`）。
+- `node tools/verify.ts` 是**零运行时依赖**的离线自检：用 `node:vm` 跑**真实的**
   `lib/client.js`（含迷你渲染器 + 假 DOM）。
-- 期望输出最后一行是 `全部通过 ✓（79 条断言 + 18 条反向验证）`，退出码 0。
+- 期望输出最后一行是 `全部通过 ✓（81 条断言 + 18 条反向验证）`，退出码 0。
   覆盖包清单契约（含 TS 工程与产物是不是 classic script）、宿主半边、客户端模块协议、
   座位注册、样式表、状态判定、藏 / 还原官方主按钮、点击提交、错误边界与降级，最后再往产物里
   注入 18 种违规**证明这些断言真的会报错**。

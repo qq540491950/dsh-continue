@@ -1,9 +1,10 @@
 /**
- * 离线自检：**纯 Node、零依赖**，直接跑真实的 `lib/client.js`（不是复制品）。
+ * 离线自检：**零运行时依赖**，直接跑真实的 `lib/client.js`（不是复制品）。
+ * 本文件由 Node 原生类型剥离直接执行：`node tools/verify.ts`。
  *
  * 用法：
- *   npm run verify        # 先构建（npm run build）再跑本文件 —— 推荐
- *   node tools/verify.mjs # 只跑自检；源码改过没构建时 A 组会报「产物比源码旧」
+ *   npm run check         # typecheck + 构建（npm run build）再跑本文件 —— 推荐
+ *   node tools/verify.ts  # 只跑自检；源码改过没构建时 A 组会报「产物比源码旧」
  *
  * 覆盖五组：
  *   A 包清单契约（投递链路要读的那几项）
@@ -20,24 +21,295 @@
 import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
-import { pathToFileURL, fileURLToPath } from "node:url";
+import { fileURLToPath } from "node:url";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const CLIENT_PATH = path.join(ROOT, "lib", "client.js");
 const HOST_PATH = path.join(ROOT, "lib", "index.js");
 const MANIFEST_PATH = path.join(ROOT, "package.json");
 const PATCH_PATH = path.join(ROOT, "cordis.patch.yml");
-/** TS 工程：源码、构建脚本、tsconfig（lib/*.js 是它们的产物，不许手改）。 */
+/** TS 工程：源码、工具脚本、tsconfig（lib/*.js 是它们的产物，不许手改）。 */
 const SRC_CLIENT_PATH = path.join(ROOT, "src", "client.ts");
 const SRC_HOST_PATH = path.join(ROOT, "src", "index.ts");
-const BUILD_PATH = path.join(ROOT, "tools", "build.mjs");
+const TOOLS_DIR = path.join(ROOT, "tools");
+const BUILD_PATH = path.join(TOOLS_DIR, "build.ts");
+const VERIFY_PATH = path.join(TOOLS_DIR, "verify.ts");
+const ASAR_PATH = path.join(TOOLS_DIR, "asar.ts");
 const TSCONFIG_PATH = path.join(ROOT, "tsconfig.json");
+const TSCONFIG_TOOLS_PATH = path.join(ROOT, "tsconfig.tools.json");
 /** 产物比源码旧多少毫秒才算「源码改过没构建」（容忍检出顺序造成的秒级抖动）。 */
 const STALE_TOLERANCE_MS = 60_000;
 
+//#region 类型声明（自检自己的形状，只在编译期存在）
+/** 假 DOM 节点：只实现本插件与断言真正用到的那一小撮 DOM 表面。 */
+interface FakeNode {
+	tagName: string;
+	attrs: Record<string, unknown>;
+	dataset: Record<string, string | undefined>;
+	style: Record<string, string>;
+	children: FakeNode[];
+	parentElement: FakeNode | null;
+	readonly parentNode: FakeNode | null;
+	textContent: string;
+	handlers?: Record<string, (event?: unknown) => void>;
+	/** 假 DOM 的取值一律宽松：断言里既有 `=== "true"` 也有 `=== false` 这类比较。 */
+	getAttribute(name: string): any;
+	setAttribute(name: string, value: unknown): void;
+	removeAttribute(name: string): void;
+	appendChild(child: FakeNode): FakeNode;
+	removeChild(child: FakeNode): FakeNode;
+	contains(other: FakeNode | null | undefined): boolean;
+	closest(selector: string): FakeNode | null;
+	matches(selector: string): boolean;
+	querySelectorAll(selector: string): FakeNode[];
+}
+
+/** 假 document：`installStyles` 只用到 head / createElement / querySelector。 */
+interface FakeDocument {
+	head: FakeNode;
+	body: FakeNode;
+	createElement(tagName: string): FakeNode;
+	querySelector(selector: string): FakeNode | null;
+	querySelectorAll(selector: string): FakeNode[];
+}
+
+/** 组件 props：宿主元素与组件共用一份宽松记录。 */
+type ComponentProps = Record<string, unknown>;
+
+/** 类组件实例（mini React 的错误边界协议）。 */
+interface ComponentInstance {
+	props: ComponentProps;
+	state: Record<string, unknown>;
+	setState(patch: unknown): void;
+	render(): unknown;
+	componentDidCatch?(error: unknown): void;
+}
+
+/** 类组件的静态面。 */
+interface ComponentStatic {
+	getDerivedStateFromError?: (error: unknown) => Record<string, unknown>;
+}
+
+/**
+ * 组件类型：同时可调用、可 new、可能带 `prototype.render` 与静态错误边界钩子。
+ * 三种形态在运行时按 `typeof` / `prototype` 判定，所以这里写成交集。
+ */
+type ComponentType = ((props: ComponentProps) => unknown) & {
+	new (props: ComponentProps): ComponentInstance;
+} & ComponentStatic & { prototype?: { render?: () => unknown } };
+
+/** vnode：mini React 的 `createElement` 产出。 */
+interface VNode {
+	type: string | ComponentType;
+	props: ComponentProps;
+	children: unknown[];
+}
+
+/** 一个 Hook 槽（值 / setState / deps / cleanup 都塞在里面）。 */
+interface HookSlot {
+	value?: unknown;
+	set?: (next: unknown) => void;
+	deps?: readonly unknown[];
+	cleanup?: unknown;
+	create?: () => unknown;
+	current?: unknown;
+}
+
+/** 组件实例（按树位置复用，Hook 才有地方存）。 */
+interface Instance {
+	type: string | ComponentType;
+	hooks: HookSlot[];
+	children: (Instance | null)[];
+	hookIndex: number;
+	component?: ComponentInstance;
+}
+
+/** 文本节点：字符串 / 数字孩子渲染出来的东西。 */
+interface TextNode {
+	text: string;
+}
+
+type RenderedNode = FakeNode | TextNode | null;
+
+/** 一次 `renderVNode` 的结果：宿主节点 / 文本 / null + 复用的实例。 */
+interface RenderResult {
+	instance: Instance | null;
+	node: RenderedNode;
+}
+
+/** 迷你渲染器对外暴露的面。 */
+interface MiniReactRenderer {
+	react: {
+		createElement(type: string | ComponentType, props?: ComponentProps | null, ...children: unknown[]): VNode;
+		useState<T>(initial: T | (() => T)): [T, (next: T | ((previous: T) => T)) => void];
+		useRef<T>(initial: T): { current: T };
+		useEffect(create: () => unknown, deps?: readonly unknown[]): void;
+		Component: (props: ComponentProps) => void;
+	};
+	setOnCommit(callback: (node: RenderedNode) => void): void;
+	setElement(element: unknown): void;
+	mount(element: unknown): RenderedNode;
+	flush(): RenderedNode;
+	forceRender(): RenderedNode;
+	unmount(): void;
+}
+
+/** 假 MutationObserver（模拟 React 重新挂载官方主按钮）。 */
+interface FakeObserverHandle {
+	disconnected: boolean;
+	fire(): void;
+}
+
+/** 模块定义：client.js 交给 `window.__ModuleLoader__` 的那个对象。 */
+interface ModuleDefinition {
+	id: string;
+	factory: (require: (specifier: string) => unknown) => any;
+}
+
+/** 装好的 bundle（真 client.js 在假沙箱里跑完的结果）。 */
+interface Bundle {
+	definition: ModuleDefinition;
+	exports: any;
+	required: string[];
+	document: FakeDocument;
+	renderer: MiniReactRenderer;
+	observers: FakeObserverHandle[];
+	loggedErrors: unknown[][];
+	h: (type: string | ComponentType, props?: ComponentProps | null, ...children: unknown[]) => VNode;
+	fireTimers(): void;
+	pendingTimers(): number;
+}
+
+/** 座位注册项（client.js 调 `ctx.slots.register` 记下来的）。 */
+interface RegistrationEntry {
+	registration: { name?: string; priority?: number; locale?: string };
+	component: unknown;
+}
+
+/** 词典（client.js 调 `ctx.locale.register` 记下来的）。 */
+interface Dictionaries {
+	zh?: Record<string, string>;
+	en?: Record<string, string>;
+}
+
+/** 假 ctx：只实现本插件用到的那三个注入面。 */
+interface PluginCtx {
+	injectKeys: unknown[];
+	registrations: RegistrationEntry[];
+	dictionaries: { namespace: unknown; dicts: Dictionaries }[];
+	effects: unknown[];
+	effect(create: () => unknown, label?: unknown): () => void;
+	locale: { register(namespace: unknown, dicts: Dictionaries): () => void };
+	slots: {
+		inject(key: unknown, callback: () => void): () => void;
+		register(registration: unknown, component: unknown): () => void;
+	};
+}
+
+/** composer 卡片假 DOM：`.trailing` 里 [standardControls, activity, 官方主按钮]。 */
+interface SeatFixture {
+	card: FakeNode;
+	row: FakeNode;
+	tools: FakeNode;
+	trailing: FakeNode;
+	standardControls: FakeNode;
+	activity: FakeNode;
+	official: FakeNode;
+}
+
+/** 座位场景的初始状态。 */
+interface SeatScenario {
+	running?: boolean;
+	locked?: boolean;
+	pendingInteraction?: boolean;
+	draft?: string;
+	attachments?: number;
+	phase?: string;
+	reason?: string;
+	chat?: "ok" | "missing" | "throwing";
+	noObserver?: boolean;
+	noInputActions?: boolean;
+	t?: (key: string) => string | undefined;
+}
+
+/** 座位可变状态（`harness.set({...})` 改这里）。 */
+interface SeatState {
+	sessionId: string;
+	running: boolean;
+	locked: boolean;
+	pendingInteraction: boolean;
+	draft: string;
+	attachments: number;
+	phase: string;
+	reason: string;
+}
+
+/** `inputActions` 被调用时记下来的一行。 */
+type Call = ["setDraft", string] | ["submit"];
+
+/** 一次 `mountSeat` 的句柄。 */
+interface Seat {
+	bundle: Bundle;
+	ctx: PluginCtx;
+	entry: RegistrationEntry;
+	fixture: SeatFixture;
+	calls: Call[];
+	state: SeatState;
+	props: ComponentProps;
+	button(): FakeNode | null;
+	officialHidden(): boolean;
+	flush(): void;
+	set(patch: Partial<SeatState>): void;
+	unmount(): void;
+}
+
+/** 断言收集器。 */
+interface Reporter {
+	ok(group: string, label: string, condition: boolean, detail?: string): boolean;
+	failures: string[];
+	readonly passed: number;
+}
+
+/** 被自检读进来的两份源码 + 补丁层（E 组会喂注入过的版本）。 */
+interface Sources {
+	client: string;
+	host: string;
+	bundlePatch: string;
+}
+
+/** package.json 里自检关心的字段。 */
+interface Manifest {
+	name: string;
+	main?: string;
+	exports: Record<string, string>;
+	files?: string[];
+	scripts?: Record<string, string>;
+	dsh?: { client?: { platform?: string }; bundle?: { patch?: string } };
+	dependencies?: Record<string, string>;
+	devDependencies?: Record<string, string>;
+	peerDependencies?: Record<string, string>;
+}
+
+/** 一条反向验证用例：往哪个源码里、把什么换成什么、必须报出哪条断言。 */
+interface Mutation {
+	label: string;
+	file: keyof Sources;
+	from: string;
+	to: string;
+	expect: string;
+}
+
+/** 一条反向验证的结果。 */
+interface MutationResult {
+	label: string;
+	status: "caught" | "missed" | "invalid";
+	detail: string;
+}
+//#endregion
+
 //#region 假 DOM
 /** 选择器匹配：只支持本插件与假 DOM 用到的那几种（tag / [attr] / tag[attr="v"]）。 */
-function matchesSelector(node, selector) {
+function matchesSelector(node: FakeNode, selector: string): boolean {
 	const attrForm = /^([A-Za-z]*)\[([^=\]]+)(?:="([^"]*)")?\]$/.exec(selector);
 	if (attrForm !== null) {
 		const [, tag, attr, value] = attrForm;
@@ -50,7 +322,7 @@ function matchesSelector(node, selector) {
 }
 
 /** camelCase → kebab-case（dataset 映射用）。 */
-function kebabCase(name) {
+function kebabCase(name: string): string {
 	return name.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
 }
 
@@ -59,7 +331,7 @@ function kebabCase(name) {
  * 而 `installStyles` 正是靠 `tag.dataset.pluginCss = …` 让 HMR 台账与
  * `document.querySelector('style[data-plugin-css=…]')` 找得到这张样式表。
  */
-function createDataset(node) {
+function createDataset(node: FakeNode): Record<string, string | undefined> {
 	return new Proxy(
 		{},
 		{
@@ -82,10 +354,11 @@ function createDataset(node) {
 }
 
 /** 一个够用的假 DOM 节点。 */
-function fakeNode(tagName, attrs) {
-	const node = {
+function fakeNode(tagName: string, attrs: Record<string, string> = {}): FakeNode {
+	const node: FakeNode = {
 		tagName: tagName.toUpperCase(),
-		attrs: { ...(attrs ?? {}) },
+		attrs: { ...attrs },
+		dataset: {},
 		style: {},
 		children: [],
 		parentElement: null,
@@ -121,7 +394,7 @@ function fakeNode(tagName, attrs) {
 			return false;
 		},
 		closest(selector) {
-			for (let cursor = this; cursor !== null; cursor = cursor.parentElement) {
+			for (let cursor: FakeNode | null = this; cursor !== null; cursor = cursor.parentElement) {
 				if (matchesSelector(cursor, selector)) return cursor;
 			}
 			return null;
@@ -130,8 +403,8 @@ function fakeNode(tagName, attrs) {
 			return matchesSelector(this, selector);
 		},
 		querySelectorAll(selector) {
-			const out = [];
-			const walk = (current) => {
+			const out: FakeNode[] = [];
+			const walk = (current: FakeNode): void => {
 				for (const child of current.children) {
 					if (matchesSelector(child, selector)) out.push(child);
 					walk(child);
@@ -146,7 +419,7 @@ function fakeNode(tagName, attrs) {
 }
 
 /** 一个够用的假 document（installStyles 只用到 head / createElement / querySelector）。 */
-function fakeDocument() {
+function fakeDocument(): FakeDocument {
 	const head = fakeNode("head");
 	const body = fakeNode("body");
 	return {
@@ -172,27 +445,37 @@ function fakeDocument() {
  *
  * 组件实例按「树位置」复用（Hook 才有地方存），宿主节点每次渲染重建（够用且简单）。
  */
-function createMiniReact() {
-	const state = { current: null, dirty: false, effectQueue: [] };
-	let rootElement = null;
-	let rootInstance = null;
-	let lastNode;
-	let onCommit = null;
+function createMiniReact(): MiniReactRenderer {
+	const state = { current: null as Instance | null, dirty: false, effectQueue: [] as HookSlot[] };
+	let rootElement: unknown = null;
+	let rootInstance: Instance | null = null;
+	let lastNode: RenderedNode = null;
+	let onCommit: ((node: RenderedNode) => void) | null = null;
 
 	/** 基类：只支持 state + setState。 */
-	function Component(props) {
+	function Component(this: ComponentInstance, props: ComponentProps): void {
 		this.props = props;
 		this.state = {};
 	}
-	Component.prototype.setState = function setState(patch) {
-		const next = typeof patch === "function" ? patch(this.state, this.props) : patch;
-		this.state = { ...this.state, ...next };
+	Component.prototype.setState = function setState(this: ComponentInstance, patch: unknown): void {
+		const next =
+			typeof patch === "function"
+				? (patch as (state: Record<string, unknown>, props: ComponentProps) => Record<string, unknown>)(
+						this.state,
+						this.props,
+					)
+				: patch;
+		this.state = { ...this.state, ...(next as Record<string, unknown>) };
 		state.dirty = true;
 	};
 
-	function createElement(type, props, ...children) {
-		const flat = [];
-		const push = (child) => {
+	function createElement(
+		type: string | ComponentType,
+		props?: ComponentProps | null,
+		...children: unknown[]
+	): VNode {
+		const flat: unknown[] = [];
+		const push = (child: unknown): void => {
 			if (child === null || child === undefined || child === false || child === true) return;
 			if (Array.isArray(child)) {
 				for (const item of child) push(item);
@@ -201,38 +484,41 @@ function createMiniReact() {
 			flat.push(child);
 		};
 		for (const child of children) push(child);
-		const merged = { ...(props ?? {}) };
+		const merged: ComponentProps = { ...(props ?? {}) };
 		merged.children = flat.length === 1 ? flat[0] : flat;
 		return { type, props: merged, children: flat };
 	}
 
-	function useState(initial) {
-		const instance = state.current;
+	function useState<T>(initial: T | (() => T)): [T, (next: T | ((previous: T) => T)) => void] {
+		const instance = state.current as Instance;
 		const index = instance.hookIndex;
 		instance.hookIndex += 1;
 		if (instance.hooks[index] === undefined) {
-			const hook = { value: typeof initial === "function" ? initial() : initial };
+			const hook: HookSlot = { value: typeof initial === "function" ? (initial as () => T)() : initial };
 			hook.set = (next) => {
-				const value = typeof next === "function" ? next(hook.value) : next;
+				const value = typeof next === "function" ? (next as (previous: unknown) => unknown)(hook.value) : next;
 				if (Object.is(value, hook.value)) return;
 				hook.value = value;
 				state.dirty = true;
 			};
 			instance.hooks[index] = hook;
 		}
-		return [instance.hooks[index].value, instance.hooks[index].set];
+		return [
+			instance.hooks[index].value as T,
+			instance.hooks[index].set as (next: T | ((previous: T) => T)) => void,
+		];
 	}
 
-	function useRef(initial) {
-		const instance = state.current;
+	function useRef<T>(initial: T): { current: T } {
+		const instance = state.current as Instance;
 		const index = instance.hookIndex;
 		instance.hookIndex += 1;
 		if (instance.hooks[index] === undefined) instance.hooks[index] = { current: initial };
-		return instance.hooks[index];
+		return instance.hooks[index] as { current: T };
 	}
 
-	function useEffect(create, deps) {
-		const instance = state.current;
+	function useEffect(create: () => unknown, deps?: readonly unknown[]): void {
+		const instance = state.current as Instance;
 		const index = instance.hookIndex;
 		instance.hookIndex += 1;
 		const previous = instance.hooks[index];
@@ -241,8 +527,8 @@ function createMiniReact() {
 			deps === undefined ||
 			previous.deps === undefined ||
 			deps.length !== previous.deps.length ||
-			deps.some((dep, at) => Object.is(dep, previous.deps[at]) === false);
-		const hook = previous ?? { deps: undefined, cleanup: undefined, create: undefined };
+			deps.some((dep, at) => Object.is(dep, (previous.deps as readonly unknown[])[at]) === false);
+		const hook: HookSlot = previous ?? { deps: undefined, cleanup: undefined, create: undefined };
 		hook.deps = deps;
 		hook.create = create;
 		instance.hooks[index] = hook;
@@ -250,28 +536,28 @@ function createMiniReact() {
 	}
 
 	/** 宿主元素的 props → 假节点（只做本插件用到的那几种）。 */
-	function applyProps(node, props) {
+	function applyProps(node: FakeNode, props: ComponentProps): void {
 		for (const [key, value] of Object.entries(props)) {
 			if (key === "children") continue;
 			if (key === "ref") {
-				if (typeof value === "function") value(node);
-				else if (value !== null && value !== undefined) value.current = node;
+				if (typeof value === "function") (value as (node: FakeNode) => void)(node);
+				else if (value !== null && value !== undefined) (value as { current: FakeNode }).current = node;
 				continue;
 			}
 			if (key === "style") {
-				Object.assign(node.style, value ?? {});
+				Object.assign(node.style, (value ?? {}) as Record<string, string>);
 				continue;
 			}
 			if (key.startsWith("on") && typeof value === "function") {
 				node.handlers = node.handlers ?? {};
-				node.handlers[key] = value;
+				node.handlers[key] = value as (event?: unknown) => void;
 				continue;
 			}
 			node.attrs[key] = value === true ? "true" : value;
 		}
 	}
 
-	function renderVNode(previous, vnode) {
+	function renderVNode(previous: Instance | null | undefined, vnode: unknown): RenderResult {
 		if (vnode === null || vnode === undefined || vnode === false || vnode === true) {
 			if (previous !== null && previous !== undefined) dispose(previous);
 			return { instance: null, node: null };
@@ -279,34 +565,36 @@ function createMiniReact() {
 		if (typeof vnode === "string" || typeof vnode === "number") {
 			return { instance: null, node: { text: String(vnode) } };
 		}
-		const type = vnode.type;
+		const element = vnode as VNode;
+		const type = element.type;
 		// 类型变了 = React 卸载旧实例（跑它的 cleanup）再挂新的；同一类型才复用 Hook 槽。
 		const reusable = previous !== null && previous !== undefined && previous.type === type;
 		if (reusable === false && previous !== null && previous !== undefined) dispose(previous);
-		const instance = reusable ? previous : { type, hooks: [], children: [] };
+		const instance: Instance = reusable ? (previous as Instance) : { type, hooks: [], children: [], hookIndex: 0 };
 
 		// 宿主元素
 		if (typeof type === "string") {
 			const node = fakeNode(type);
-			applyProps(node, vnode.props);
-			const rendered = vnode.children.map((child, index) => renderVNode(instance.children[index], child));
+			applyProps(node, element.props);
+			const rendered = element.children.map((child, index) => renderVNode(instance.children[index], child));
 			// 存的是**子实例**（不是 {instance,node} 包装）——存错会让下一轮全部重新挂载、Hook 状态清零。
 			instance.children = rendered.map((child) => child.instance);
-			for (const child of rendered) if (child.node !== null) node.appendChild(child.node);
+			for (const child of rendered) if (child.node !== null) node.appendChild(child.node as FakeNode);
 			return { instance, node };
 		}
 
 		// 类组件（错误边界）
-		if (type.prototype !== undefined && typeof type.prototype.render === "function") {
-			const component = instance.component ?? new type(vnode.props);
+		const asClass = type as ComponentType;
+		if (asClass.prototype !== undefined && typeof asClass.prototype.render === "function") {
+			const component = instance.component ?? new asClass(element.props);
 			instance.component = component;
-			component.props = vnode.props;
-			let rendered;
+			component.props = element.props;
+			let rendered: RenderResult;
 			try {
 				rendered = renderVNode(instance.children[0], component.render());
 			} catch (error) {
-				if (typeof type.getDerivedStateFromError !== "function") throw error;
-				component.state = { ...component.state, ...type.getDerivedStateFromError(error) };
+				if (typeof asClass.getDerivedStateFromError !== "function") throw error;
+				component.state = { ...component.state, ...asClass.getDerivedStateFromError(error) };
 				if (typeof component.componentDidCatch === "function") component.componentDidCatch(error);
 				rendered = renderVNode(instance.children[0], component.render());
 			}
@@ -318,9 +606,9 @@ function createMiniReact() {
 		const outer = state.current;
 		state.current = instance;
 		instance.hookIndex = 0;
-		let out;
+		let out: unknown;
 		try {
-			out = type(vnode.props);
+			out = (type as (props: ComponentProps) => unknown)(element.props);
 		} finally {
 			state.current = outer;
 		}
@@ -330,26 +618,26 @@ function createMiniReact() {
 	}
 
 	/** 提交阶段：先跑旧 cleanup，再跑新 effect。 */
-	function commitEffects() {
+	function commitEffects(): void {
 		const queue = state.effectQueue;
 		state.effectQueue = [];
 		for (const hook of queue) {
-			if (typeof hook.cleanup === "function") hook.cleanup();
-			hook.cleanup = hook.create();
+			if (typeof hook.cleanup === "function") (hook.cleanup as () => void)();
+			hook.cleanup = (hook.create as () => unknown)();
 		}
 	}
 
 	/** 卸载整棵树：自底向上跑 cleanup。 */
-	function dispose(instance) {
+	function dispose(instance: Instance | null | undefined): void {
 		if (instance === null || instance === undefined) return;
 		for (const child of instance.children ?? []) dispose(child);
 		for (const hook of instance.hooks ?? []) {
-			if (typeof hook.cleanup === "function") hook.cleanup();
+			if (typeof hook.cleanup === "function") (hook.cleanup as () => void)();
 			hook.cleanup = undefined;
 		}
 	}
 
-	function pass() {
+	function pass(): RenderedNode {
 		state.effectQueue = [];
 		const rendered = renderVNode(rootInstance, rootElement);
 		rootInstance = rendered.instance;
@@ -405,13 +693,13 @@ function createMiniReact() {
 
 //#region 加载真实 bundle
 /** 把真实的 `lib/client.js` 装进 vm，用假 `window.__ModuleLoader__` 抓注册项。 */
-function loadBundle(source, options = {}) {
+function loadBundle(source: string, options: { noObserver?: boolean } = {}): Bundle {
 	const document = fakeDocument();
-	const timers = { seq: 0, pending: new Map() };
-	const observers = [];
-	const required = [];
-	const loggedErrors = [];
-	let captured = null;
+	const timers = { seq: 0, pending: new Map<number, { fn: () => void; ms: number }>() };
+	const observers: FakeObserverHandle[] = [];
+	const required: string[] = [];
+	const loggedErrors: unknown[][] = [];
+	let captured: ModuleDefinition | null = null;
 	const mini = createMiniReact();
 	// 沙箱里的 console.error 收进数组：一来断言「边界确实上报了」，二来不把自检输出刷成一片红。
 	const sandboxConsole = {
@@ -419,24 +707,25 @@ function loadBundle(source, options = {}) {
 		info: () => {},
 		warn: () => {},
 		debug: () => {},
-		error: (...args) => {
+		error: (...args: unknown[]) => {
 			loggedErrors.push(args);
 		},
 	};
-	const sandbox = {
+	// vm 沙箱本质上是一张动态表：这里保留宽松类型，往下的断言仍然逐条钉住行为。
+	const sandbox: Record<string, any> = {
 		document,
 		console: sandboxConsole,
-		setTimeout: (fn, ms) => {
+		setTimeout: (fn: () => void, ms: number) => {
 			const id = (timers.seq += 1);
 			timers.pending.set(id, { fn, ms });
 			return id;
 		},
-		clearTimeout: (id) => {
+		clearTimeout: (id: number) => {
 			timers.pending.delete(id);
 		},
 		window: {
 			__ModuleLoader__: {
-				load(definition) {
+				load(definition: ModuleDefinition) {
 					captured = definition;
 				},
 			},
@@ -444,7 +733,10 @@ function loadBundle(source, options = {}) {
 	};
 	if (options.noObserver !== true) {
 		sandbox.MutationObserver = class FakeMutationObserver {
-			constructor(callback) {
+			callback: (records: unknown[]) => void;
+			disconnected: boolean;
+
+			constructor(callback: (records: unknown[]) => void) {
 				this.callback = callback;
 				this.disconnected = false;
 				observers.push(this);
@@ -463,13 +755,14 @@ function loadBundle(source, options = {}) {
 	vm.createContext(sandbox);
 	vm.runInContext(source, sandbox, { filename: "lib/client.js" });
 	if (captured === null) throw new Error("client.js 没有调用 window.__ModuleLoader__.load");
-	const moduleExports = captured.factory((specifier) => {
+	const definition: ModuleDefinition = captured;
+	const moduleExports = definition.factory((specifier: string) => {
 		required.push(specifier);
 		if (specifier === "react") return mini.react;
 		throw new Error(`测试替身没有提供模块 "${specifier}"`);
 	});
 	return {
-		definition: captured,
+		definition,
 		exports: moduleExports,
 		required,
 		document,
@@ -488,8 +781,8 @@ function loadBundle(source, options = {}) {
 }
 
 /** 用假 ctx 跑真实 `apply`，收集注册项。 */
-function applyPlugin(bundle, options = {}) {
-	const ctx = {
+function applyPlugin(bundle: Bundle, options: { deferInject?: boolean } = {}): PluginCtx {
+	const ctx: PluginCtx = {
 		injectKeys: [],
 		registrations: [],
 		dictionaries: [],
@@ -498,7 +791,7 @@ function applyPlugin(bundle, options = {}) {
 			ctx.effects.push(label);
 			const dispose = create();
 			return () => {
-				if (typeof dispose === "function") dispose();
+				if (typeof dispose === "function") (dispose as () => void)();
 			};
 		},
 		locale: {
@@ -514,7 +807,7 @@ function applyPlugin(bundle, options = {}) {
 				return () => {};
 			},
 			register(registration, component) {
-				ctx.registrations.push({ registration, component });
+				ctx.registrations.push({ registration: registration as RegistrationEntry["registration"], component });
 				return () => {};
 			},
 		},
@@ -526,7 +819,7 @@ function applyPlugin(bundle, options = {}) {
 
 //#region 座位场景
 /** 造一个 composer 卡片：`.trailing` 里 [standardControls, activity, 官方主按钮]。 */
-function createFixture() {
+function createFixture(): SeatFixture {
 	const card = fakeNode("div", { "data-composer-card": "true" });
 	const row = fakeNode("div");
 	const tools = fakeNode("div");
@@ -544,7 +837,9 @@ function createFixture() {
 }
 
 /** 造一份 Chat target 快照（只带 timeline）。`reason === "none"` 表示还没有结束的轮次。 */
-function chatSnapshot(reason) {
+function chatSnapshot(reason: string): {
+	timeline: { turnOrder: number[]; turns: Map<number, { status: string; end: { data: { reason: { kind: string } } } }> };
+} {
 	if (reason === "none") return { timeline: { turnOrder: [], turns: new Map() } };
 	return {
 		timeline: {
@@ -559,14 +854,14 @@ function chatSnapshot(reason) {
  * @param source - client.js 源码。
  * @param scenario - 初始状态；之后用 `harness.set({...})` 改。
  */
-function mountSeat(source, scenario = {}) {
+function mountSeat(source: string, scenario: SeatScenario = {}): Seat {
 	const bundle = loadBundle(source, { noObserver: scenario.noObserver === true });
 	const ctx = applyPlugin(bundle);
 	const entry = ctx.registrations[0];
 	if (entry === undefined) throw new Error("apply 没有注册任何座位条目");
 	const fixture = createFixture();
-	const calls = [];
-	const state = {
+	const calls: Call[] = [];
+	const state: SeatState = {
 		sessionId: "s1",
 		running: scenario.running === true,
 		locked: scenario.locked === true,
@@ -577,12 +872,12 @@ function mountSeat(source, scenario = {}) {
 		reason: scenario.reason ?? "completed",
 	};
 	const chatMode = scenario.chat ?? "ok";
-	const props = {
+	const props: ComponentProps = {
 		locked: scenario.locked === true,
 		// `t` 显式传 undefined 时才走兜底（不能用 `scenario.t === undefined` 判断，那和「没传」分不开）。
-		t: "t" in scenario ? scenario.t : (key) => `T:${key}`,
-		useSession: (selector) => selector({ running: state.running === true }),
-		useSessionStatus: (selector) =>
+		t: "t" in scenario ? scenario.t : (key: string) => `T:${key}`,
+		useSession: <T>(selector: (session: any) => T): T => selector({ running: state.running === true }),
+		useSessionStatus: <T>(selector: (statuses: any) => T): T =>
 			selector(
 				new Map([
 					[
@@ -594,13 +889,13 @@ function mountSeat(source, scenario = {}) {
 					],
 				]),
 			),
-		useInput: (selector) =>
+		useInput: <T>(selector: (input: any) => T): T =>
 			selector({
 				draft: state.draft,
 				attachmentIds: new Array(state.attachments).fill("att"),
 				phase: state.phase,
 			}),
-		useChat: (selector) => {
+		useChat: <T>(selector: (snapshot: unknown) => T): T => {
 			if (chatMode === "throwing") throw new Error("chat hook 不可用");
 			return selector(chatSnapshot(state.reason));
 		},
@@ -613,18 +908,18 @@ function mountSeat(source, scenario = {}) {
 	});
 	if (scenario.noInputActions !== true) {
 		props.inputActions = {
-			setDraft: (text) => calls.push(["setDraft", text]),
+			setDraft: (text: string) => calls.push(["setDraft", text]),
 			submit: () => calls.push(["submit"]),
 		};
 	}
 
-	const attach = (node) => {
+	const attach = (node: RenderedNode): void => {
 		for (const child of [...fixture.activity.children]) fixture.activity.removeChild(child);
-		if (node !== null && node !== undefined) fixture.activity.appendChild(node);
+		if (node !== null && node !== undefined) fixture.activity.appendChild(node as FakeNode);
 	};
 	// 关键顺序：节点必须在 effect 之前进 DOM，否则组件顺着 parentElement 找不到卡片。
 	bundle.renderer.setOnCommit(attach);
-	bundle.renderer.mount(bundle.h(entry.component, props));
+	bundle.renderer.mount(bundle.h(entry.component as string | ComponentType, props));
 
 	return {
 		bundle,
@@ -648,7 +943,7 @@ function mountSeat(source, scenario = {}) {
 		/** 改状态并强制重渲染（重建 vnode：props 是元素创建时快照的，改了状态必须重建）。 */
 		set(patch) {
 			Object.assign(state, patch);
-			bundle.renderer.setElement(bundle.h(entry.component, props));
+			bundle.renderer.setElement(bundle.h(entry.component as string | ComponentType, props));
 			bundle.renderer.forceRender();
 		},
 		unmount() {
@@ -660,8 +955,8 @@ function mountSeat(source, scenario = {}) {
 
 //#region 断言工具
 /** 一次套件运行的失败收集器。 */
-function createReporter() {
-	const failures = [];
+function createReporter(): Reporter {
+	const failures: string[] = [];
 	let passed = 0;
 	return {
 		ok(group, label, condition, detail) {
@@ -687,7 +982,7 @@ function createReporter() {
  * @param manifest - package.json 解析结果。
  * @returns `{ failures, passed }`。
  */
-async function runSuite(sources, manifest) {
+async function runSuite(sources: Sources, manifest: Manifest): Promise<{ failures: string[]; passed: number }> {
 	const source = sources.client;
 	const hostSource = sources.host;
 	const report = createReporter();
@@ -719,11 +1014,13 @@ async function runSuite(sources, manifest) {
 		`实际 ${JSON.stringify(patchRowName)}`,
 	);
 
-	// ---- A' TS 工程（源码在 src/，投递产物在 lib/，产物由 tools/build.mjs 原子替换） ----
+	// ---- A' TS 工程（源码在 src/，投递产物在 lib/，产物由 tools/build.ts 原子替换） ----
 	ok(
 		"A",
-		"TS 源码与构建脚本齐备",
-		[SRC_CLIENT_PATH, SRC_HOST_PATH, TSCONFIG_PATH, BUILD_PATH].every((file) => fs.existsSync(file)),
+		"TS 源码与工具脚本齐备（src/*.ts + tools/*.ts + 两份 tsconfig）",
+		[SRC_CLIENT_PATH, SRC_HOST_PATH, TSCONFIG_PATH, TSCONFIG_TOOLS_PATH, BUILD_PATH, VERIFY_PATH, ASAR_PATH].every(
+			(file) => fs.existsSync(file),
+		),
 	);
 	ok(
 		"A",
@@ -733,6 +1030,21 @@ async function runSuite(sources, manifest) {
 			typeof manifest.scripts?.verify === "string",
 		`devDependencies=${JSON.stringify(manifest.devDependencies)}，scripts=${JSON.stringify(manifest.scripts)}`,
 	);
+	const toolFiles = fs.readdirSync(TOOLS_DIR);
+	ok(
+		"A",
+		"tools/ 全是 TypeScript（Node 原生类型剥离直接执行），没有 .mjs 残留",
+		toolFiles.length > 0 && toolFiles.every((file) => file.endsWith(".ts")),
+		`实际 ${JSON.stringify(toolFiles)}`,
+	);
+	ok(
+		"A",
+		"npm scripts 跑的就是这些 .ts 工具（build / verify / typecheck）",
+		(manifest.scripts?.build ?? "").includes("tools/build.ts") &&
+			(manifest.scripts?.verify ?? "").includes("tools/verify.ts") &&
+			(manifest.scripts?.typecheck ?? "").includes("tsconfig.tools.json"),
+		`实际 ${JSON.stringify(manifest.scripts)}`,
+	);
 	ok(
 		"A",
 		"产物仍是 classic script（无 import / export / __esModule 包装）",
@@ -741,7 +1053,11 @@ async function runSuite(sources, manifest) {
 			source.includes("window.__ModuleLoader__.load("),
 	);
 	const clientMtime = fs.statSync(CLIENT_PATH).mtimeMs;
-	const sourceMtime = Math.max(fs.statSync(SRC_CLIENT_PATH).mtimeMs, fs.statSync(SRC_HOST_PATH).mtimeMs);
+	const sourceMtime = Math.max(
+		fs.statSync(SRC_CLIENT_PATH).mtimeMs,
+		fs.statSync(SRC_HOST_PATH).mtimeMs,
+		fs.statSync(BUILD_PATH).mtimeMs,
+	);
 	ok(
 		"A",
 		"产物不比源码旧（改完 src 先 npm run build）",
@@ -819,7 +1135,7 @@ async function runSuite(sources, manifest) {
 	ok("C", "座位未声明时不注册（走 slots.inject 等待）", deferred.registrations.length === 0 && deferred.injectKeys.length === 1);
 
 	// ---- D 行为 ----
-	const visible = (reason, extra) => {
+	const visible = (reason: string, extra?: SeatScenario): { seat: Seat; shown: boolean; hidden: boolean } => {
 		const seat = mountSeat(source, { reason, ...extra });
 		return { seat, shown: seat.button() !== null, hidden: seat.officialHidden() };
 	};
@@ -919,7 +1235,7 @@ async function runSuite(sources, manifest) {
 	ok("D", "useChat 缺失时渲染 null 且不抛", noChatSeat.button() === null && noChatSeat.officialHidden() === false);
 	noChatSeat.unmount();
 	let chatThrowPropagated = false;
-	let chatThrowSeat = null;
+	let chatThrowSeat: Seat | null = null;
 	try {
 		chatThrowSeat = mountSeat(source, { reason: "error", chat: "throwing" });
 	} catch {
@@ -957,7 +1273,7 @@ async function runSuite(sources, manifest) {
  * 1. 锚点必须**恰好出现一次**，否则该用例无效（不能记成「没报出」）；
  * 2. 注入可能让套件**崩掉**（而不是报 FAIL）——那也必须单独判为用例无效。
  */
-const MUTATIONS = [
+const MUTATIONS: Mutation[] = [
 	{ label: "座位 priority 改回 0", file: "client", from: "priority: -1,", to: "priority: 0,", expect: "[C] priority 必须是 -1" },
 	{ label: "去掉 aborted 触发条件", file: "client", from: 'const RESUME_REASONS = ["aborted", "error", "max-tokens"];', to: 'const RESUME_REASONS = ["error", "max-tokens"];', expect: "异常结束（aborted）" },
 	{ label: "草稿非空也照样接管", file: "client", from: "state.empty !== true", to: "state.empty === null", expect: "草稿非空时让位给发送键" },
@@ -975,7 +1291,7 @@ const MUTATIONS = [
 		label: "产物被写成模块包装（tsc 把 client 当 ESM / CJS）",
 		file: "client",
 		from: 'Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });',
-		to: 'Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });\n		exports.__esModule = true;',
+		to: 'Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });\n        exports.__esModule = true;',
 		expect: "产物仍是 classic script",
 	},
 	{ label: "宿主半边引入 import", file: "host", from: "/** 空实现：只作为投递链路的接线柱。 */", to: 'import "node:fs";\n\n/** 空实现：只作为投递链路的接线柱。 */', expect: "宿主半边零 import" },
@@ -985,8 +1301,8 @@ const MUTATIONS = [
 ];
 
 /** 跑反向验证，返回逐条结果。 */
-async function runMutations(sources, manifest) {
-	const results = [];
+async function runMutations(sources: Sources, manifest: Manifest): Promise<MutationResult[]> {
+	const results: MutationResult[] = [];
 	for (const mutation of MUTATIONS) {
 		const original = sources[mutation.file];
 		const occurrences = original.split(mutation.from).length - 1;
@@ -994,12 +1310,12 @@ async function runMutations(sources, manifest) {
 			results.push({ label: mutation.label, status: "invalid", detail: `锚点出现 ${occurrences} 次（必须恰好 1 次）` });
 			continue;
 		}
-		const mutated = { ...sources, [mutation.file]: original.replace(mutation.from, mutation.to) };
-		let outcome;
+		const mutated: Sources = { ...sources, [mutation.file]: original.replace(mutation.from, mutation.to) };
+		let outcome: { failures: string[]; passed: number };
 		try {
 			outcome = await runSuite(mutated, manifest);
 		} catch (error) {
-			results.push({ label: mutation.label, status: "invalid", detail: `注入后套件崩了：${error.message}` });
+			results.push({ label: mutation.label, status: "invalid", detail: `注入后套件崩了：${(error as Error).message}` });
 			continue;
 		}
 		const hit = outcome.failures.filter((failure) => failure.includes(mutation.expect));
@@ -1014,8 +1330,8 @@ async function runMutations(sources, manifest) {
 //#endregion
 
 //#region 入口
-const manifest = JSON.parse(fs.readFileSync(MANIFEST_PATH, "utf8"));
-const sources = {
+const manifest = JSON.parse(fs.readFileSync(MANIFEST_PATH, "utf8")) as Manifest;
+const sources: Sources = {
 	client: fs.readFileSync(CLIENT_PATH, "utf8"),
 	host: fs.readFileSync(HOST_PATH, "utf8"),
 	bundlePatch: fs.readFileSync(PATCH_PATH, "utf8"),

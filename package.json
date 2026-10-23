@@ -1,6 +1,6 @@
 {
   "name": "dsh-continue",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "DSH Web 客户端插件：任务异常结束或被手动停止后，把 composer 的发送按钮换成「继续」按钮——不用输入任何内容，点一下就能接着干。",
   "type": "module",
@@ -11,8 +11,10 @@
     "README.md"
   ],
   "scripts": {
-    "build": "node tools/build.mjs",
-    "verify": "node tools/build.mjs && node tools/verify.mjs"
+    "build": "node tools/build.ts",
+    "verify": "node tools/build.ts && node tools/verify.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.tools.json",
+    "check": "npm run typecheck && npm run verify"
   },
   "exports": {
     ".": "./lib/index.js",
@@ -35,6 +37,7 @@
     "@deepseek-ai/cordis": "~4.0.4"
   },
   "devDependencies": {
+    "@types/node": "^24.19.2",
     "typescript": "^5.9.3"
   }
 }
