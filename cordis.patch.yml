@@ -1,0 +1,17 @@
+# dsh-continue 自带的补丁层：`package.json` 的 `dsh.bundle.patch` 指向本文件。
+#
+# 所以本仓库整包就是一个 bundle：把它装进 DSH 时，profile 的 `package.json` 依赖与
+# `dsh.profile.bundles` 由安装器写，下面这一行 insert 随 bundle 一起生效——
+# profile 的 `cordis.patch.yml` **不需要手改**，仓库搬家也不用改路径。
+#
+# 装法（GUI，推荐）：侧栏「插件」→「添加插件」→ 填本仓库的绝对路径 → 安装 → 立即启用。
+# 同一个动作也可以由 `plugin_manager` 的 `install_bundle`（target = 同一个路径）完成。
+#
+# 为什么必须写在 `insert:` 下：顶层裸写 `- id: X` 的语义是「覆写已存在的同 id 条目」，
+# 目标不存在时 Loader 会报 `entry not found` 并丢弃该行（补丁层语义）。
+#
+# `name` 必须等于 `package.json` 的 `name`：以 bundle 形态安装时它由 profile 的
+# node_modules 解析。手写形态（profile 补丁层里加一行）则写本仓库的绝对路径。
+- insert:
+    - id: dsh-continue # Loader 条目 id
+      name: dsh-continue # 必须等于 package.json 的 name

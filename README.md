@@ -3,9 +3,11 @@
 DSH 桌面端（Web GUI）的**纯客户端**插件：让 composer 的**发送按钮**在「上一轮没跑完」时
 自动变成**「继续」按钮**——不用输入任何内容，点一下就把任务接着干下去。
 
-- **自用维护，不发布**。`package.json` 里 `"private": true`；不做 npm 发布、不带构建步骤。
-  接线只有一种：DSH profile 里的一个路径行。
-- **零运行时依赖、零构建步骤**。`lib/client.js` 就是直接投递给浏览器的产物，改完即产物。
+- **自用维护，不发布到 npm**。`package.json` 里 `"private": true`，发布形态是 **GitHub tag**
+  （`github:qq540491950/dsh-continue#vX.Y.Z`），装法见第 3 节。
+- **TypeScript 源码 + 一行构建**：源码在 `src/`，`npm run build` 用 `tsc` 生成
+  `lib/client.js` / `lib/index.js`（产物**入库**，因为没有安装期构建步骤）。
+  运行时仍然**零依赖**：TypeScript 只在 `devDependencies`。
 - 仓库里只有 Linux 风格 LF 换行（`.gitattributes` 强制），不要提交 CRLF。
 
 ---
@@ -46,34 +48,58 @@ DSH 桌面端（Web GUI）的**纯客户端**插件：让 composer 的**发送�
 **「回答被截断……发送「继续」可让模型接着输出」**（`dsh-client-ui-chat` 的
 `message.maxTokens.hint`）。本插件只是把那句话替你打了，顺手把按钮换成图标。
 
-> 想换这个词：改 `lib/client.js` 里的 `CONTINUE_TEXT`（只有这一处）。
+> 想换这个词：改 `src/client.ts` 里的 `CONTINUE_TEXT`（只有这一处），然后 `npm run build`。
 
-## 3. 接线（profile 补丁里加一行）
+## 3. 安装（作为插件安装，不手改 profile）
 
-`C:\Users\admin\.dsh\profiles\desktop\cordis.patch.yml` 末尾追加：
+本仓库整包就是一个 **bundle 插件**：`package.json` 的 `dsh.bundle.patch` 指向
+[cordis.patch.yml](cordis.patch.yml)，那一层里的 `insert` 行就是接线本身。安装时由 DSH 写
+profile 的 `package.json` 依赖与 `dsh.profile.bundles`，卸载时随依赖一起消失——
+**不用手改 profile 的 `cordis.patch.yml`，仓库搬家也不用改路径。**
 
-```yaml
-- insert:
-    - id: dsh-continue
-      name: 'file:///D:/project/dsh-plugins/dsh-continue/lib/index.js'
-```
+1. 打开 DSH 桌面端（Web GUI），点左侧栏的 **「插件」**。
+2. 点右上 **「添加插件」**（主按钮直接打开安装对话框；箭头里的「安装第三方插件」打开同一
+   个框）。
+3. 包名输入框里填 **GitHub spec**：
+
+   ```
+   github:qq540491950/dsh-continue#v0.2.0
+   ```
+
+   安装器认四种 spec：registry 包名、绝对路径、git 地址（`github:用户/仓库#tag`）、tarball。
+   本包 `"private": true` 且未发布到 npm，所以用 GitHub tag（与 `dsh-effort-picker` 一致）。
+4. 点 **「安装」**；装完的画面上再点 **「立即启用」**（直接关掉对话框等于「装好但停用」）。
+5. 界面没变化就 `Ctrl+R` 刷新一次页面。
+
+装完的台账：profile 的 `package.json` 多一条
+`"dsh-continue": "github:qq540491950/dsh-continue#<commit>"`，`dsh.profile.bundles` 里多一项
+`dsh-continue`；profile 的 `cordis.patch.yml` 一个字都没变。
 
 - **宿主半边** `lib/index.js` 是空的 `apply`，只作为投递链路的接线柱：客户端 bundle 由
   `@deepseek-ai/dsh-client-modules` 从这个包 `package.json` 的 `exports["./client"]` 定位，
   再由 Host 在 `/plugins` 下发布。
-- 改完客户端代码**刷新页面**即可（`dsh-client-hmr` 也会热替换，但只有
-  `pnpm run dev:web` 同时在跑时才免刷新）。
-- **移除**：删掉那一行，刷新页面，官方发送按钮立刻原样回来。
+- **卸载 / 回滚**：同一个插件页里把 `dsh-continue` 这个组合包**关掉**（或点卸载），刷新页面，
+  官方发送键立刻原样回来。命令行等价物是 `dsh plugin --profile desktop remove dsh-continue`。
+- **开发期**（改代码立刻看效果）：用**本仓库绝对路径**作为 spec 装一次
+  （`D:\project\dsh-plugins\dsh-continue`，会装成 link）。之后改 `src/` → `npm run build` →
+  刷新页面就是新代码，**不用重新安装**。发布给别人时一律用 GitHub tag。
 
-## 4. 自检
+## 4. 开发与自检
 
 ```powershell
-node tools/verify.mjs
+npm install          # 只装 typescript（devDependency）
+npm run verify       # = npm run build + node tools/verify.mjs
 ```
 
-期望输出最后一行是 `全部通过 ✓（65 条断言 + 13 条反向验证）`，退出码 0。
-覆盖包清单契约、宿主半边、客户端模块协议、座位注册、样式表、状态判定、藏 / 还原官方主按钮、
-点击提交、错误边界与降级，最后再往源码里注入 13 种违规**证明这些断言真的会报错**。
+- `npm run build`：`src/*.ts` → `tsc` → `.build/` → 校验投递契约 → **临时文件 + 原子替换**
+  进 `lib/*.js`（`dsh-client-hmr` 读到半截文件会让插件彻底消失，所以不许就地写）。
+- `node tools/verify.mjs` 是**纯 Node、零依赖**的离线自检：用 `node:vm` 跑**真实的**
+  `lib/client.js`（含迷你渲染器 + 假 DOM）。
+- 期望输出最后一行是 `全部通过 ✓（79 条断言 + 18 条反向验证）`，退出码 0。
+  覆盖包清单契约（含 TS 工程与产物是不是 classic script）、宿主半边、客户端模块协议、
+  座位注册、样式表、状态判定、藏 / 还原官方主按钮、点击提交、错误边界与降级，最后再往产物里
+  注入 18 种违规**证明这些断言真的会报错**。
+- **不要手改 `lib/*.js`**：它是产物，下次构建会被覆盖。
 
 ## 5. 已知边界（别当成 bug）
 

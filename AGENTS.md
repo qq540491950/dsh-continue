@@ -8,13 +8,21 @@
 DSH 桌面端（Web GUI）的**纯客户端**插件：composer 的主操作按钮在「上一轮异常结束 / 被手动停止 /
 输出被截断」且草稿为空时，变成**「继续」按钮**（同一位置、同尺寸），点一下就把「继续」替你发出去。
 
+**源码是 TypeScript**（`src/*.ts`），投递产物是 `lib/*.js`（`npm run build` 生成、**提交进仓库**）。
+装法只有一个：把本仓库当一个 **bundle 插件**装进 profile（GitHub spec 或绝对路径，见 README 第 3 节），
+**不手改 profile 的补丁层**。
+
 ### 文件职责
 
 | 文件 | 职责 | 改它的风险 |
 |---|---|---|
-| `lib/client.js` | 浏览器半边：全部 UI 与交互，`window.__ModuleLoader__` 懒 CJS bundle | **高**——第 2 节四条硬规则里三条都在这里 |
-| `lib/index.js` | 宿主半边：空 `apply`，只作为 Loader 的接线柱 | 低，但**不许删**：删了 `dsh-client-modules` 从该条目向上找不到 `package.json`，客户端 bundle 就不再投递 |
+| `src/client.ts` | 浏览器半边的**唯一源码**：全部 UI 与交互，编译后是 `window.__ModuleLoader__` 懒 CJS bundle | **高**——第 2 节四条硬规则里三条都在这里 |
+| `src/index.ts` | 宿主半边的源码：空 `apply`，只作为 Loader 的接线柱 | 低，但**不许删**：删了 `dsh-client-modules` 从该条目向上找不到 `package.json`，客户端 bundle 就不再投递 |
+| `lib/client.js` / `lib/index.js` | **构建产物**（`tsc` 输出后原子替换），不是手写文件 | **不许手改**——下次 `npm run build` 会覆盖；要改就改 `src/` |
+| `tsconfig.json` | TS 配置：`moduleDetection: "legacy"` 保证 `src/client.ts` 被当 classic script 编译；`outDir: ".build"` | 中——改成 ESM / CJS 产出就直接破坏模块协议（verify A 的 `__esModule` 断言守着） |
+| `tools/build.mjs` | 构建：`src/` → `.build/` → 校验投递契约 → **临时文件 + 原子替换**进 `lib/`（2.4） | 中——绕过它手写 `lib/` 就是复活 2.4 的半截文件事故 |
 | `package.json` | 包清单契约（第 4 节） | 中——改错就整体不加载 |
+| `cordis.patch.yml` | 包自带的补丁层：bundle 形态的接线行（`package.json` 的 `dsh.bundle.patch` 指向它，GUI「添加插件」/`plugin_manager.install_bundle` 安装时读它） | 中——`insert` 行的 `id` / `name` 都必须等于包名；裸写顶层 `- id: X` 会变成"覆写不存在的条目"而被 Loader 丢弃 |
 | `tools/verify.mjs` | 离线自检：纯 Node、零依赖，用 `node:vm` 跑**真实的** `lib/client.js`（含迷你渲染器 + 假 DOM） | 低；改它必须同步改断言，**不许为了让它变绿而放宽断言** |
 | `tools/asar.mjs` | 开发工具：从 `app.asar` 里只读取官方源码（`list` / `read` / `grep`） | 低；不是插件的一部分，不参与投递 |
 | `README.md` | 面向使用者的介绍与使用说明 | 低 |
@@ -71,13 +79,16 @@ DSH 桌面端（Web GUI）的**纯客户端**插件：composer 的主操作按�
 先 `cordis_inspect_query(platform: client, provider: Slots, method: listSubTree, root: "conversation.input.activity")`
 看 `standardProps` 里有没有，有就用，没有就想清楚代价（第 2.2 节就是这么来的）。
 
-### 2.4 HMR 可能读到半截文件
+### 2.4 HMR 可能读到半截文件（**永远不要手写 `lib/`**）
 
 `dsh-client-hmr` 每 500ms 按 mtime/ctime/size 判版本。文件写到一半时被读到，按失败策略
 「替换失败不回滚」，插件会彻底消失（界面里继续按钮没了，官方按钮原样）。
 
-**写 `lib/client.js` 一定要写临时文件再原子替换**，不要就地截断写入。恢复办法：重新保存一次
-`lib/client.js`（内容不变也行，mtime/size 变了宿主就会发新 rev），或 `Ctrl+R` 刷新页面。
+所以产物只由 `tools/build.mjs` 落地：先 `tsc` 编译到 `.build/`（类型错误在这一步失败，
+`lib/` 一个字节都不动），校验投递契约后再**同目录临时文件 + rename** 替换 `lib/*.js`。
+手写 / 就地截断 `lib/client.js` 等于复活这个事故。
+
+产物没变也要宿主重发 rev 时：重跑一次 `npm run build`（mtime 变了就行），或 `Ctrl+R` 刷新页面。
 
 ## 3. 不能改的东西（不变量）
 
@@ -85,6 +96,7 @@ DSH 桌面端（Web GUI）的**纯客户端**插件：composer 的主操作按�
 |---|---|---|
 | bundle `id` 必须等于 `package.json` 的 `name` | `dsh-client-modules` 用它做模块身份 | verify A / C |
 | `exports["./client"]` / `exports["./package.json"]` / `dsh.client.platform: "web"` | 投递链路的读取契约 | verify A |
+| 包自带补丁层 `cordis.patch.yml` 的 `insert` 行 `id` / `name` 都等于包名，且接线只写在 `insert:` 下 | bundle 形态（GUI「添加插件」）由 profile 的 `node_modules` 解析该 `name`；`id` 对不上插件页的开关就找不到条目 | verify A |
 | 座位注册必须留 `priority: -1` | `single` 座位**同 priority 直接抛错**（`single slot "…" already has a registration at priority 0`）；一旦官方或别的插件也占这一格，注册期抛错会让整个插件激活失败。`-1` 的语义是"最低者渲染" | verify C |
 | 座位注册必须走 `slots.inject("conversation.input.activity", …)` | 座位未声明时直接 `register` 会抛 `slot "…" is not declared`；`slots.inject` 负责等声明 | verify C |
 | `SeatBoundary` 必须包住座位子树 | 2.1 | verify D |
@@ -99,20 +111,25 @@ DSH 桌面端（Web GUI）的**纯客户端**插件：composer 的主操作按�
 | 提交后自己 `disabled`，`running` 翻起或超时（8s）才解除 | 乐观提交期间 `running` 还没翻，没有闸门就会连点排两条「继续」 | verify D |
 | 文案走 `ctx.locale.register(NS, {zh, en})`，两份 key 集合一致 | 官方 practices 要求可见文案走 locale；`t` 缺失 / 返回空串时退回中文兜底 | verify C / D |
 | 词典 key 覆盖三种原因 + 兜底 | 悬停提示要说清"为什么变成这样" | verify C |
+| `lib/client.js` 必须仍是 classic script：无 `import` / `export` 语句、无 `__esModule` / CJS 包装 | 投递链路按 classic script 执行它；一旦 `src/client.ts` 变成 ESM（加了一行 `import`/`export`），`tsc` 会产出模块包装，`window.__ModuleLoader__.load` 不再被调用，插件静默消失 | verify A（`moduleDetection: "legacy"` 是它的前提） |
+| 浏览器半边必须**单文件**（`src/client.ts` 不拆模块） | `require` 只认平台种子模块，相对 `require` 在浏览器里解析不到；拆文件就只能上打包器，多一个失败面 | 人工 + verify C（`require` 面只有 `react`） |
+| 产物必须由 `npm run build` 生成、且不早于源码 | 手写 `lib/` 会绕过 2.4 的原子替换；改了 `src/` 忘了构建则投递的是旧逻辑 | verify A（`__esModule` / 产物新旧两条断言） |
 
-**不要顺手做的重构**：不加依赖、不引入构建 / 打包工具、不把 `lib/client.js` 拆成多文件
-（它必须是一个 classic script，不是 ESM）、不改有意的硬编码、不"美化"间距到与现状不一致
-（diff 越小越好）。
+**不要顺手做的重构**：不加运行时依赖、不引入打包器（`tsc` 之外不需要构建工具）、不把
+`src/client.ts` 拆成多文件（它必须编译成一个 classic script，不是 ESM）、不改有意的硬编码、
+不"美化"间距到与现状不一致（diff 越小越好；`tsc` 自己会把 tab 缩进改成 4 空格，别为此手改产物）。
 
 ## 4. 改动流程（做完算数才算完）
 
-1. 改代码（`lib/client.js` 用临时文件 + 原子替换写）。
-2. **跑自检**：
+1. 改 `src/client.ts`（或 `src/index.ts`）；**不要碰 `lib/*.js`**。
+2. **构建 + 自检一步到位**：
 
    ```powershell
-   node tools/verify.mjs
+   npm run verify
    ```
 
+   它等于 `npm run build`（`src/` → `.build/` → 校验 → 原子替换 `lib/`）+ `node tools/verify.mjs`。
+   只想构建：`npm run build`；只想自检（不再构建）：`node tools/verify.mjs`。
 3. **必须看到最后一行 `全部通过 ✓（N 条断言 + M 条反向验证）` 且退出码 0**。
    失败时会打印 `失败 N 项：` 并 `exit 1`。
 4. 只有第 3 步过了才有资格说"改好了"。**禁止**在没跑自检、或自检失败的情况下汇报成功；
@@ -121,10 +138,12 @@ DSH 桌面端（Web GUI）的**纯客户端**插件：composer 的主操作按�
    报错。两个自欺陷阱必须避开：
    - 锚点必须**恰好出现一次**，否则该用例无效（脚本会打 `锚点出现 0 次`，不能记成"没报出"）；
    - 注入可能让套件**崩掉**而不是报 FAIL——那也必须单独判为**用例无效**。
-6. 提交前跑编码检查：
+   - 锚点是**产物**（`lib/client.js`）的文本，不是 `src/client.ts`：`tsc` 会把 tab 改成 4 空格、
+     会把 `if (x) return;` 拆成两行，所以锚点要挑**单行、不含缩进依赖**的片段。
+6. 提交前跑编码检查（源码和产物都查）：
 
    ```powershell
-   node -e "const fs=require('fs');const b=fs.readFileSync('lib/client.js');const t=b.toString('utf8');console.log((b[0]===0xEF?'BOM!':'no-bom'),(t.includes(String.fromCharCode(0xFFFD))?'FFFD!':'clean'),'crlf='+(t.match(/\r\n/g)||[]).length)"
+   node -e "const fs=require('fs');for(const f of ['src/client.ts','src/index.ts','lib/client.js','lib/index.js']){const b=fs.readFileSync(f);const t=b.toString('utf8');console.log(f,(b[0]===0xEF?'BOM!':'no-bom'),(t.includes(String.fromCharCode(0xFFFD))?'FFFD!':'clean'),'crlf='+(t.match(/\r\n/g)||[]).length)}"
    ```
 
 ### 自检自身的坑（写 `tools/verify.mjs` 前必读）
@@ -135,7 +154,7 @@ DSH 桌面端（Web GUI）的**纯客户端**插件：composer 的主操作按�
 | 子实例必须存**实例本身**，不是 `{instance, node}` 包装 | 第二轮渲染全部重新挂载、Hook 状态清零 → `setState` / effect cleanup 全部失效 | `instance.children = rendered.map((child) => child.instance)` |
 | 假 DOM 的 `dataset` 必须是**活映射** | `tag.dataset.pluginCss = …` 只写了对象字段，`querySelector('style[data-plugin-css=…]')` 永远找不到 | 用 `Proxy` 把 `dataset.xY` 映射到 `data-x-y` 属性 |
 | 宿主半边的断言不能只 `import` 磁盘文件 | 注入过的版本测不到 | 用 `data:text/javascript;base64,…` 就地求值 |
-| 沙箱 `console` 要收进数组 | 13 条反向验证会把 stderr 刷成 149 行红字，真正的失败被埋掉 | `loggedErrors`，顺便断言"边界确实上报了一条" |
+| 沙箱 `console` 要收进数组 | 十几条反向验证会把 stderr 刷成上百行红字，真正的失败被埋掉 | `loggedErrors`，顺便断言"边界确实上报了一条" |
 | 断言里带半真半假的「或」 | 等于没断言 | 拆成两条，或只留真判断 |
 | 一条永远为真的断言 | 比没有更糟（虚假安全感） | 每条都要有一条能打破它的 `MUTATIONS` |
 
@@ -143,24 +162,32 @@ DSH 桌面端（Web GUI）的**纯客户端**插件：composer 的主操作按�
 
 | 症状 | 原因 | 恢复 |
 |---|---|---|
-| 继续按钮整个没了，官方发送键正常 | 条目被退役（2.1 / 2.4） | 重新保存一次 `lib/client.js`（内容不变也行），或 `Ctrl+R` 刷新页面。不必重启 DSH |
+| 继续按钮整个没了，官方发送键正常 | 条目被退役（2.1 / 2.4） | 重跑 `npm run build`（产物 mtime 变了宿主就发新 rev），或 `Ctrl+R` 刷新页面。不必重启 DSH |
 | 官方发送键被藏了但继续按钮没出现 | 藏与渲染不同步（不该发生；`hide()` 与 `visible` 同一个 effect） | 刷新页面；并把 `localStorage` / 控制台里 `[dsh-continue]` 前缀的记录贴出来 |
-| 想立刻回到官方控件 | — | 删掉 profile 里 `id: dsh-continue` 那个 insert 行，刷新页面 |
+| 想立刻回到官方控件 | — | 插件页里把 `dsh-continue` 这个组合包**关掉**（或卸载），刷新页面。命令行等价物：`dsh plugin --profile desktop remove dsh-continue` |
 | 想看失败原因 | — | 控制台 `[dsh-continue]` 前缀（座位内边界只打一条，不刷屏） |
 
-## 6. 只碰自己那一行
+## 6. 安装与 profile：只走插件安装器
 
-profile 是**用户的环境**，不是本仓库的一部分：
-`C:\Users\admin\.dsh\profiles\desktop\cordis.patch.yml`。在里面**只允许增删
-`id: dsh-continue` 这一个 insert 行**——其它条目的配置（模型、推理强度、搜索 provider、MCP、
-密钥）都不属于本任务范围，不要"顺手"改。补丁层里新增条目必须用 `insert:` 追加，
-裸写 `- id: ...` 会被当成覆盖目标，id 不存在时 Loader 报 `entry not found` 并丢弃该条。
+profile 是**用户的环境**，不是本仓库的一部分。本插件的装法是**当成 bundle 插件安装**：
+`plugin_manager(action: "install_bundle", target: "github:qq540491950/dsh-continue#vX.Y.Z")`
+（等价于 GUI 侧栏「插件」→「添加插件」→ 填同一个 spec → 「立即启用」）。安装器负责写 profile 的
+`package.json` 依赖与 `dsh.profile.bundles`，卸载时一起消失。
+
+纪律：
+
+- **不要手改 profile 的 `cordis.patch.yml`**（不要加 `file:///...lib/index.js` 那行"本地调试"接线）：
+  那条路要人肉维护绝对路径，和 bundle 安装同时存在还会撞 id。
+- 需要临时试改时：改本仓库 `src/` → `npm run build` → 因为装的是本仓库（开发期可用绝对路径
+  spec 装成 link），刷新页面即生效；**发布版一律用 GitHub tag**。
+- profile 里其它条目（模型、推理强度、搜索 provider、MCP、密钥）不属于本任务范围，不要"顺手"改。
 
 ## 7. 本机事实（会漂移，别当契约）
 
-- 仓库路径：`D:\project\dsh-plugins\dsh-continue`（profile 里的路径行依赖它）。
-- profile 补丁：`C:\Users\admin\.dsh\profiles\desktop\cordis.patch.yml`。
-- Node：v24.14.1（自检只需标准库）。
+- 仓库路径：`D:\project\dsh-plugins\dsh-continue`；远端 `https://github.com/qq540491950/dsh-continue.git`。
+- 安装 spec：`github:qq540491950/dsh-continue#vX.Y.Z`（tag 必须指向已提交、已含 `lib/` 的 commit）。
+- profile 补丁（只读参考，不要手改）：`C:\Users\admin\.dsh\profiles\desktop\cordis.patch.yml`。
+- Node：v24.14.1；TypeScript 5.9（`devDependencies`，构建用；自检本身只用标准库）。
 - 官方源码在 `D:\Program Files\DeepSeek Harness\resources\app.asar` 里，用
   `node tools/asar.mjs read <asar 内路径>` 取；关键出处：
   - 主按钮与 `conversation.input.activity` 的渲染位置：`@deepseek-ai/dsh-client-ui-conversation/lib/client.js`
@@ -177,6 +204,9 @@ profile 是**用户的环境**，不是本仓库的一部分：
 
 - 分支 `main`；提交信息用中文 Conventional Commits（`feat:` / `fix:` / `docs:` / `chore:`），
   一行说清改了什么。
+- **发版**：改 `package.json` 的 `version` → `npm run verify` 全绿 → 提交 → `git tag vX.Y.Z` →
+  `git push origin main --tags`。GitHub 安装器按 tag 取 tarball，**tag 必须指向已含 `lib/` 的提交**，
+  否则装到一个没有产物的包（加载器什么都找不到，也没有报错）。
 - **不要提交敏感信息**：profile 的 `cordis.patch.yml` 里有 API key（MCP / 搜索 provider），
   它**不在本仓库内**，永远不要把它、或它的片段、或任何 token 复制进本仓库。
 - 提交信息写进 UTF-8 文件后用 `git commit -F` 传入，不要用 `-m` 直传中文。

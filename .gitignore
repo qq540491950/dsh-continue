@@ -6,6 +6,8 @@ node_modules/
 dist/
 build/
 out/
+# tsc 的中间产物（lib/ 是提交进仓库的投递产物，.build/ 只是它的一次性暂存）
+.build/
 *.tsbuildinfo
 .cache/
 

@@ -2,7 +2,8 @@
  * 离线自检：**纯 Node、零依赖**，直接跑真实的 `lib/client.js`（不是复制品）。
  *
  * 用法：
- *   node tools/verify.mjs
+ *   npm run verify        # 先构建（npm run build）再跑本文件 —— 推荐
+ *   node tools/verify.mjs # 只跑自检；源码改过没构建时 A 组会报「产物比源码旧」
  *
  * 覆盖五组：
  *   A 包清单契约（投递链路要读的那几项）
@@ -25,6 +26,14 @@ const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const CLIENT_PATH = path.join(ROOT, "lib", "client.js");
 const HOST_PATH = path.join(ROOT, "lib", "index.js");
 const MANIFEST_PATH = path.join(ROOT, "package.json");
+const PATCH_PATH = path.join(ROOT, "cordis.patch.yml");
+/** TS 工程：源码、构建脚本、tsconfig（lib/*.js 是它们的产物，不许手改）。 */
+const SRC_CLIENT_PATH = path.join(ROOT, "src", "client.ts");
+const SRC_HOST_PATH = path.join(ROOT, "src", "index.ts");
+const BUILD_PATH = path.join(ROOT, "tools", "build.mjs");
+const TSCONFIG_PATH = path.join(ROOT, "tsconfig.json");
+/** 产物比源码旧多少毫秒才算「源码改过没构建」（容忍检出顺序造成的秒级抖动）。 */
+const STALE_TOLERANCE_MS = 60_000;
 
 //#region 假 DOM
 /** 选择器匹配：只支持本插件与假 DOM 用到的那几种（tag / [attr] / tag[attr="v"]）。 */
@@ -695,6 +704,50 @@ async function runSuite(sources, manifest) {
 	ok("A", "bundle id 等于包名", bundleIdMatch !== null && bundleIdMatch[1] === packageName);
 	ok("A", "零运行时依赖（没有 dependencies）", manifest.dependencies === undefined);
 	ok("A", "manifest 引用的文件都存在", fs.existsSync(path.join(ROOT, manifest.exports["."])) && fs.existsSync(CLIENT_PATH));
+	// bundle 形态（GUI「添加插件」整包安装）靠包自带的补丁层接线，profile 不需要手改。
+	ok("A", 'dsh.bundle.patch 指向自带的补丁层', manifest.dsh?.bundle?.patch === "./cordis.patch.yml", `实际 ${JSON.stringify(manifest.dsh?.bundle?.patch)}`);
+	ok("A", "补丁层文件存在且被 files 收进包", fs.existsSync(PATCH_PATH) && (manifest.files ?? []).includes("cordis.patch.yml"));
+	const patchText = sources.bundlePatch;
+	ok("A", "补丁层恰好一个 insert 行", patchText.split("\n").filter((line) => /^-\s*insert:\s*$/.test(line)).length === 1);
+	const patchRowId = /^\s*-\s*id:\s*([^\s#]+)/m.exec(patchText)?.[1];
+	const patchRowName = /^\s*name:\s*([^\s#]+)/m.exec(patchText)?.[1];
+	ok("A", "补丁行的 id 等于包名", patchRowId === packageName, `实际 ${JSON.stringify(patchRowId)}`);
+	ok(
+		"A",
+		"补丁行的 name 等于包名（bundle 形态由 profile 的 node_modules 解析）",
+		patchRowName === packageName,
+		`实际 ${JSON.stringify(patchRowName)}`,
+	);
+
+	// ---- A' TS 工程（源码在 src/，投递产物在 lib/，产物由 tools/build.mjs 原子替换） ----
+	ok(
+		"A",
+		"TS 源码与构建脚本齐备",
+		[SRC_CLIENT_PATH, SRC_HOST_PATH, TSCONFIG_PATH, BUILD_PATH].every((file) => fs.existsSync(file)),
+	);
+	ok(
+		"A",
+		"TypeScript 只在 devDependencies（运行时仍然零依赖）",
+		typeof manifest.devDependencies?.typescript === "string" &&
+			typeof manifest.scripts?.build === "string" &&
+			typeof manifest.scripts?.verify === "string",
+		`devDependencies=${JSON.stringify(manifest.devDependencies)}，scripts=${JSON.stringify(manifest.scripts)}`,
+	);
+	ok(
+		"A",
+		"产物仍是 classic script（无 import / export / __esModule 包装）",
+		/(^|\n)\s*(import|export)\s/.test(source) === false &&
+			source.includes("__esModule") === false &&
+			source.includes("window.__ModuleLoader__.load("),
+	);
+	const clientMtime = fs.statSync(CLIENT_PATH).mtimeMs;
+	const sourceMtime = Math.max(fs.statSync(SRC_CLIENT_PATH).mtimeMs, fs.statSync(SRC_HOST_PATH).mtimeMs);
+	ok(
+		"A",
+		"产物不比源码旧（改完 src 先 npm run build）",
+		clientMtime + STALE_TOLERANCE_MS >= sourceMtime,
+		`lib/client.js 比 src 旧 ${Math.round((sourceMtime - clientMtime) / 1000)}s`,
+	);
 
 	// ---- B 宿主半边 ----
 	ok("B", "宿主半边零 import / 零 require", /(^|\n)\s*(import\s|const\s+.*require\()/.test(hostSource) === false);
@@ -907,18 +960,28 @@ async function runSuite(sources, manifest) {
 const MUTATIONS = [
 	{ label: "座位 priority 改回 0", file: "client", from: "priority: -1,", to: "priority: 0,", expect: "[C] priority 必须是 -1" },
 	{ label: "去掉 aborted 触发条件", file: "client", from: 'const RESUME_REASONS = ["aborted", "error", "max-tokens"];', to: 'const RESUME_REASONS = ["error", "max-tokens"];', expect: "异常结束（aborted）" },
-	{ label: "草稿非空也照样接管", file: "client", from: "if (state.empty !== true) return false;", to: "if (state.empty === null) return false;", expect: "草稿非空时让位给发送键" },
-	{ label: "运行中也接管", file: "client", from: "if (state.running === true) return false;", to: "if (state.running === null) return false;", expect: "运行中不接管主按钮" },
+	{ label: "草稿非空也照样接管", file: "client", from: "state.empty !== true", to: "state.empty === null", expect: "草稿非空时让位给发送键" },
+	{ label: "运行中也接管", file: "client", from: "state.running === true", to: "state.running === null", expect: "运行中不接管主按钮" },
 	{ label: "继续文本改成别的词", file: "client", from: 'const CONTINUE_TEXT = "继续";', to: 'const CONTINUE_TEXT = "go on";', expect: 'setDraft("继续")' },
-	{ label: "点击只 setDraft 不 submit", file: "client", from: "\t\t\t\t\tinputActions.submit();", to: "\t\t\t\t\tvoid inputActions.submit;", expect: "再 submit()" },
+	{ label: "点击只 setDraft 不 submit", file: "client", from: "                    inputActions.submit();", to: "                    void inputActions.submit;", expect: "再 submit()" },
 	{ label: "去掉座位内错误边界", file: "client", from: "return h(SeatBoundary, null, h(ContinuePrimary, props));", to: "return h(ContinuePrimary, props);", expect: "useChat 抛错被座位内边界兜住" },
 	{ label: "观察者不再重新藏按钮", file: "client", from: "const observer = new MutationObserver(hide);", to: "const observer = new MutationObserver(() => {});", expect: "官方主按钮被换节点后观察者重新藏起" },
 	{ label: "换会话时不重挂观察者", file: "client", from: "}, [active, sessionId]);", to: "}, [active]);", expect: "换会话后重新挂了观察者" },
-	{ label: "卸载不还原官方主按钮", file: "client", from: "\t\t\t\t\trestoreHidden();\n\t\t\t\t};", to: "\t\t\t\t\tvoid restoreHidden;\n\t\t\t\t};", expect: "卸载后官方主按钮还原" },
+	{ label: "卸载不还原官方主按钮", file: "client", from: "                    restoreHidden();\n                };", to: "                    void restoreHidden;\n                };", expect: "卸载后官方主按钮还原" },
 	{ label: "把正常结束也算成异常", file: "client", from: 'const RESUME_REASONS = ["aborted", "error", "max-tokens"];', to: 'const RESUME_REASONS = ["aborted", "error", "max-tokens", "completed"];', expect: "正常结束（completed）不接管主按钮" },
 	{ label: "静态注入面漏掉 locale", file: "client", from: 'exports.inject = ["slots", "locale"];', to: 'exports.inject = ["slots"];', expect: "静态注入面是 slots + locale" },
 	{ label: "bundle id 与包名不一致", file: "client", from: 'id: "dsh-continue",', to: 'id: "dsh-continue-typo",', expect: "id 等于包名" },
+	{
+		label: "产物被写成模块包装（tsc 把 client 当 ESM / CJS）",
+		file: "client",
+		from: 'Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });',
+		to: 'Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });\n		exports.__esModule = true;',
+		expect: "产物仍是 classic script",
+	},
 	{ label: "宿主半边引入 import", file: "host", from: "/** 空实现：只作为投递链路的接线柱。 */", to: 'import "node:fs";\n\n/** 空实现：只作为投递链路的接线柱。 */', expect: "宿主半边零 import" },
+	{ label: "补丁行的 id 与包名不一致", file: "bundlePatch", from: "    - id: dsh-continue", to: "    - id: dsh-continue-typo", expect: "补丁行的 id 等于包名" },
+	{ label: "补丁行的 name 与包名不一致", file: "bundlePatch", from: "      name: dsh-continue", to: "      name: dsh-continue-typo", expect: "补丁行的 name 等于包名" },
+	{ label: "补丁层没有 insert 行", file: "bundlePatch", from: "- insert:", to: "- overwrite:", expect: "补丁层恰好一个 insert 行" },
 ];
 
 /** 跑反向验证，返回逐条结果。 */
@@ -952,7 +1015,11 @@ async function runMutations(sources, manifest) {
 
 //#region 入口
 const manifest = JSON.parse(fs.readFileSync(MANIFEST_PATH, "utf8"));
-const sources = { client: fs.readFileSync(CLIENT_PATH, "utf8"), host: fs.readFileSync(HOST_PATH, "utf8") };
+const sources = {
+	client: fs.readFileSync(CLIENT_PATH, "utf8"),
+	host: fs.readFileSync(HOST_PATH, "utf8"),
+	bundlePatch: fs.readFileSync(PATCH_PATH, "utf8"),
+};
 const suite = await runSuite(sources, manifest);
 const mutations = await runMutations(sources, manifest);
 
