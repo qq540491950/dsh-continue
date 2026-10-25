@@ -1,6 +1,6 @@
 {
   "name": "dsh-continue",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "license": "MIT",
   "description": "DSH Web 客户端插件：任务异常结束或被手动停止后，把 composer 的发送按钮换成「继续」按钮——不用输入任何内容，点一下就能接着干。",
