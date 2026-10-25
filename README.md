@@ -63,7 +63,7 @@ profile 的 `package.json` 依赖与 `dsh.profile.bundles`，卸载时随依赖�
 3. 包名输入框里填 **GitHub spec**：
 
    ```
-   github:qq540491950/dsh-continue#v0.2.0
+   github:qq540491950/dsh-continue#vX.Y.Z
    ```
 
    安装器认四种 spec：registry 包名、绝对路径、git 地址（`github:用户/仓库#tag`）、tarball。

@@ -2,7 +2,7 @@
  * 浏览器半边（Client half）——DSH 自带的「懒 CJS」模块协议。
  *
  * 源码是**本文件**（`src/client.ts`，TypeScript）；投递产物是 `lib/client.js`，
- * 由 `npm run build`（`tools/build.mjs`，原子替换）生成。**不要手改 `lib/client.js`**。
+ * 由 `npm run build`（`tools/build.ts`，原子替换）生成。**不要手改 `lib/client.js`**。
  *
  * 契约（见 @deepseek-ai/dsh-client-modules）：
  *   1. 编译后必须仍是**单个 classic script**，不是 ESM；执行时只做一件事：
@@ -49,7 +49,7 @@
  *    否则「props 从缺到有」会让同一个组件实例的 Hook 数量变化，React 直接报错。
  * C. **HMR 可能读到半截文件**：`dsh-client-hmr` 按 mtime/size 判版本，就地截断写入时被读到
  *    会按「替换失败不回滚」处理，插件彻底消失。所以改代码只改 `src/client.ts`，产物由
- *    `tools/build.mjs` 写临时文件再原子替换——**永远不要手写 `lib/client.js`**。
+ *    `tools/build.ts` 写临时文件再原子替换——**永远不要手写 `lib/client.js`**。
  */
 
 /** ModuleLoader 注入的 `require`：只认平台种子模块。 */
