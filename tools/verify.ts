@@ -270,11 +270,12 @@ interface Reporter {
 	readonly passed: number;
 }
 
-/** 被自检读进来的两份源码 + 补丁层（E 组会喂注入过的版本）。 */
+/** 被自检读进来的两份源码 + 补丁层 + 包清单文本（E 组会喂注入过的版本）。 */
 interface Sources {
 	client: string;
 	host: string;
 	bundlePatch: string;
+	manifest: string;
 }
 
 /** package.json 里自检关心的字段。 */
@@ -284,7 +285,7 @@ interface Manifest {
 	exports: Record<string, string>;
 	files?: string[];
 	scripts?: Record<string, string>;
-	dsh?: { client?: { platform?: string }; bundle?: { patch?: string } };
+	dsh?: { client?: { platform?: string; inject?: string[] }; bundle?: { patch?: string } };
 	dependencies?: Record<string, string>;
 	devDependencies?: Record<string, string>;
 	peerDependencies?: Record<string, string>;
@@ -836,11 +837,42 @@ function createFixture(): SeatFixture {
 	return { card, row, tools, trailing, standardControls, activity, official };
 }
 
-/** 造一份 Chat target 快照（只带 timeline）。`reason === "none"` 表示还没有结束的轮次。 */
+/**
+ * 造一份 Chat target 快照（只带 timeline）。
+ * - `"none"`：还没有结束的轮次；
+ * - `"multi"`：上一轮已收尾，最新一轮 end 已到但 status 还没翻成 closed（竞态窗口）；
+ * - `"multi-open"`：上一轮已收尾，最新一轮还在跑、连 end 都没有。
+ */
 function chatSnapshot(reason: string): {
-	timeline: { turnOrder: number[]; turns: Map<number, { status: string; end: { data: { reason: { kind: string } } } }> };
+	timeline: {
+		turnOrder: number[];
+		turns: Map<number, { status: string; end: { data: { reason: { kind: string } } } | undefined }>;
+	};
 } {
 	if (reason === "none") return { timeline: { turnOrder: [], turns: new Map() } };
+	if (reason === "multi") {
+		return {
+			timeline: {
+				turnOrder: [1, 2],
+				turns: new Map([
+					[1, { status: "closed", end: { data: { reason: { kind: "aborted" } } } }],
+					// end 事件先到、status 还没翻成 closed：官方判「只认 closed」要挡住的正是它。
+					[2, { status: "open", end: { data: { reason: { kind: "aborted" } } } }],
+				]),
+			},
+		};
+	}
+	if (reason === "multi-open") {
+		return {
+			timeline: {
+				turnOrder: [1, 2],
+				turns: new Map([
+					[1, { status: "closed", end: { data: { reason: { kind: "aborted" } } } }],
+					[2, { status: "open", end: undefined }],
+				]),
+			},
+		};
+	}
 	return {
 		timeline: {
 			turnOrder: [1],
@@ -978,11 +1010,11 @@ function createReporter(): Reporter {
 //#region 套件
 /**
  * 跑完整套断言。
- * @param sources - `{client, host}` 两份源码（E 组会喂被注入过的版本）。
- * @param manifest - package.json 解析结果。
+ * @param sources - 两份源码 + 补丁层 + 包清单文本（E 组会喂被注入过的版本）。
  * @returns `{ failures, passed }`。
  */
-async function runSuite(sources: Sources, manifest: Manifest): Promise<{ failures: string[]; passed: number }> {
+async function runSuite(sources: Sources): Promise<{ failures: string[]; passed: number }> {
+	const manifest = JSON.parse(sources.manifest) as Manifest;
 	const source = sources.client;
 	const hostSource = sources.host;
 	const report = createReporter();
@@ -998,7 +1030,20 @@ async function runSuite(sources: Sources, manifest: Manifest): Promise<{ failure
 	ok("A", "main 指向宿主半边", manifest.main === "lib/index.js");
 	ok("A", "bundle id 等于包名", bundleIdMatch !== null && bundleIdMatch[1] === packageName);
 	ok("A", "零运行时依赖（没有 dependencies）", manifest.dependencies === undefined);
-	ok("A", "manifest 引用的文件都存在", fs.existsSync(path.join(ROOT, manifest.exports["."])) && fs.existsSync(CLIENT_PATH));
+	// 残缺清单要报 FAIL 而不是让整套件崩掉：崩掉时反向验证只能给 invalid，判不了 caught/missed。
+	const dotExport = manifest.exports?.["."];
+	ok(
+		"A",
+		"manifest 引用的文件都存在",
+		typeof dotExport === "string" && fs.existsSync(path.join(ROOT, dotExport)) && fs.existsSync(CLIENT_PATH),
+	);
+	// 客户端 bundle 的加载顺序依赖：声明客户端半边在 ui-conversation 之后投递，误删则 bundle 静默不投递。
+	const clientInject = manifest.dsh?.client?.inject;
+	ok(
+		"A",
+		"客户端 bundle 的投递顺序依赖在清单里（dsh.client.inject）",
+		Array.isArray(clientInject) && clientInject.includes("@deepseek-ai/dsh-client-ui-conversation"),
+	);
 	// bundle 形态（GUI「添加插件」整包安装）靠包自带的补丁层接线，profile 不需要手改。
 	ok("A", 'dsh.bundle.patch 指向自带的补丁层', manifest.dsh?.bundle?.patch === "./cordis.patch.yml", `实际 ${JSON.stringify(manifest.dsh?.bundle?.patch)}`);
 	ok("A", "补丁层文件存在且被 files 收进包", fs.existsSync(PATCH_PATH) && (manifest.files ?? []).includes("cordis.patch.yml"));
@@ -1171,6 +1216,17 @@ async function runSuite(sources: Sources, manifest: Manifest): Promise<{ failure
 	const blankSeat = visible("aborted", { draft: "   " });
 	ok("D", "纯空白草稿视为空", blankSeat.shown === true);
 	blankSeat.seat.unmount();
+	// 多轮时间线：上一轮异常收尾、最新一轮还没 closed——不许拿旧一轮的原因接管新的一轮。
+	const staleEndSeat = visible("multi");
+	ok(
+		"D",
+		"最新一轮尚未 closed（end 已提前到达）时不接管主按钮",
+		staleEndSeat.shown === false && staleEndSeat.hidden === false,
+	);
+	staleEndSeat.seat.unmount();
+	const openTurnSeat = visible("multi-open");
+	ok("D", "最新一轮还在跑（还没有 end）时不接管主按钮", openTurnSeat.shown === false && openTurnSeat.hidden === false);
+	openTurnSeat.seat.unmount();
 
 	// 点击 → 提交「继续」
 	const clickSeat = mountSeat(source, { reason: "aborted" });
@@ -1191,6 +1247,10 @@ async function runSuite(sources: Sources, manifest: Manifest): Promise<{ failure
 	clickSeat.flush();
 	ok("D", "提交中按钮自己禁用（防连点排两条）", clickSeat.button()?.getAttribute("disabled") === "true");
 	ok("D", "提交中官方主按钮仍被藏起", clickSeat.officialHidden() === true);
+	// busy 闸门的行为断言：闸住期间再点一下，不许再排一条。
+	const busyCalls = clickSeat.calls.length;
+	clickSeat.button()?.handlers?.onClick?.();
+	ok("D", "busy 期间连点不重复提交", clickSeat.calls.length === busyCalls, JSON.stringify(clickSeat.calls));
 	clickSeat.bundle.fireTimers();
 	clickSeat.flush();
 	ok("D", "busy 超时后自动解除", clickSeat.button()?.getAttribute("disabled") === false);
@@ -1279,11 +1339,11 @@ const MUTATIONS: Mutation[] = [
 	{ label: "草稿非空也照样接管", file: "client", from: "state.empty !== true", to: "state.empty === null", expect: "草稿非空时让位给发送键" },
 	{ label: "运行中也接管", file: "client", from: "state.running === true", to: "state.running === null", expect: "运行中不接管主按钮" },
 	{ label: "继续文本改成别的词", file: "client", from: 'const CONTINUE_TEXT = "继续";', to: 'const CONTINUE_TEXT = "go on";', expect: 'setDraft("继续")' },
-	{ label: "点击只 setDraft 不 submit", file: "client", from: "                    inputActions.submit();", to: "                    void inputActions.submit;", expect: "再 submit()" },
+	{ label: "点击只 setDraft 不 submit", file: "client", from: "inputActions.submit();", to: "void inputActions.submit;", expect: "再 submit()" },
 	{ label: "去掉座位内错误边界", file: "client", from: "return h(SeatBoundary, null, h(ContinuePrimary, props));", to: "return h(ContinuePrimary, props);", expect: "useChat 抛错被座位内边界兜住" },
 	{ label: "观察者不再重新藏按钮", file: "client", from: "const observer = new MutationObserver(hide);", to: "const observer = new MutationObserver(() => {});", expect: "官方主按钮被换节点后观察者重新藏起" },
 	{ label: "换会话时不重挂观察者", file: "client", from: "}, [active, sessionId]);", to: "}, [active]);", expect: "换会话后重新挂了观察者" },
-	{ label: "卸载不还原官方主按钮", file: "client", from: "                    restoreHidden();\n                };", to: "                    void restoreHidden;\n                };", expect: "卸载后官方主按钮还原" },
+	{ label: "卸载不还原官方主按钮", file: "client", from: "restoreHidden();", to: "void restoreHidden;", expect: "卸载后官方主按钮还原" },
 	{ label: "把正常结束也算成异常", file: "client", from: 'const RESUME_REASONS = ["aborted", "error", "max-tokens"];', to: 'const RESUME_REASONS = ["aborted", "error", "max-tokens", "completed"];', expect: "正常结束（completed）不接管主按钮" },
 	{ label: "静态注入面漏掉 locale", file: "client", from: 'exports.inject = ["slots", "locale"];', to: 'exports.inject = ["slots"];', expect: "静态注入面是 slots + locale" },
 	{ label: "bundle id 与包名不一致", file: "client", from: 'id: "dsh-continue",', to: 'id: "dsh-continue-typo",', expect: "id 等于包名" },
@@ -1298,10 +1358,15 @@ const MUTATIONS: Mutation[] = [
 	{ label: "补丁行的 id 与包名不一致", file: "bundlePatch", from: "    - id: dsh-continue", to: "    - id: dsh-continue-typo", expect: "补丁行的 id 等于包名" },
 	{ label: "补丁行的 name 与包名不一致", file: "bundlePatch", from: "      name: dsh-continue", to: "      name: dsh-continue-typo", expect: "补丁行的 name 等于包名" },
 	{ label: "补丁层没有 insert 行", file: "bundlePatch", from: "- insert:", to: "- overwrite:", expect: "补丁层恰好一个 insert 行" },
+	{ label: "busy 期间连点照常提交", file: "client", from: "if (busy)", to: "if (false)", expect: "busy 期间连点不重复提交" },
+	{ label: "去掉 status === closed 检查", file: "client", from: '|| turn.status !== "closed"', to: "", expect: "end 已提前到达" },
+	{ label: "取第一轮而不是最新一轮", file: "client", from: "order[order.length - 1]", to: "order[0]", expect: "还没有 end" },
+	{ label: '清单缺 exports["."]', file: "manifest", from: '".": "./lib/index.js",', to: "", expect: "manifest 引用的文件都存在" },
+	{ label: "客户端投递顺序依赖被删", file: "manifest", from: '"@deepseek-ai/dsh-client-ui-conversation"', to: '"@deepseek-ai/dsh-client-ui-not-a-package"', expect: "投递顺序依赖" },
 ];
 
 /** 跑反向验证，返回逐条结果。 */
-async function runMutations(sources: Sources, manifest: Manifest): Promise<MutationResult[]> {
+async function runMutations(sources: Sources): Promise<MutationResult[]> {
 	const results: MutationResult[] = [];
 	for (const mutation of MUTATIONS) {
 		const original = sources[mutation.file];
@@ -1313,7 +1378,7 @@ async function runMutations(sources: Sources, manifest: Manifest): Promise<Mutat
 		const mutated: Sources = { ...sources, [mutation.file]: original.replace(mutation.from, mutation.to) };
 		let outcome: { failures: string[]; passed: number };
 		try {
-			outcome = await runSuite(mutated, manifest);
+			outcome = await runSuite(mutated);
 		} catch (error) {
 			results.push({ label: mutation.label, status: "invalid", detail: `注入后套件崩了：${(error as Error).message}` });
 			continue;
@@ -1330,14 +1395,14 @@ async function runMutations(sources: Sources, manifest: Manifest): Promise<Mutat
 //#endregion
 
 //#region 入口
-const manifest = JSON.parse(fs.readFileSync(MANIFEST_PATH, "utf8")) as Manifest;
 const sources: Sources = {
 	client: fs.readFileSync(CLIENT_PATH, "utf8"),
 	host: fs.readFileSync(HOST_PATH, "utf8"),
 	bundlePatch: fs.readFileSync(PATCH_PATH, "utf8"),
+	manifest: fs.readFileSync(MANIFEST_PATH, "utf8"),
 };
-const suite = await runSuite(sources, manifest);
-const mutations = await runMutations(sources, manifest);
+const suite = await runSuite(sources);
+const mutations = await runMutations(sources);
 
 console.log("=".repeat(72));
 console.log(`dsh-continue 自检：${suite.passed} 条断言通过，${suite.failures.length} 条失败`);

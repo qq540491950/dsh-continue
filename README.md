@@ -100,7 +100,7 @@ npm run check        # = typecheck（src + tools）+ build + verify
 - `npm run typecheck`：`tsc -p tsconfig.json --noEmit`（`src/`）+ `tsc -p tsconfig.tools.json`（`tools/`）。
 - `node tools/verify.ts` 是**零运行时依赖**的离线自检：用 `node:vm` 跑**真实的**
   `lib/client.js`（含迷你渲染器 + 假 DOM）。
-- 期望输出最后一行是 `全部通过 ✓（81 条断言 + 18 条反向验证）`，退出码 0。
+- 期望输出最后一行是 `全部通过 ✓（85 条断言 + 23 条反向验证）`，退出码 0。
   覆盖包清单契约（含 TS 工程与产物是不是 classic script）、宿主半边、客户端模块协议、
   座位注册、样式表、状态判定、藏 / 还原官方主按钮、点击提交、错误边界与降级，最后再往产物里
   注入 18 种违规**证明这些断言真的会报错**。
