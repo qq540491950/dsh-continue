@@ -843,14 +843,14 @@ function createFixture(): SeatFixture {
  * - `"multi"`：上一轮已收尾，最新一轮 end 已到但 status 还没翻成 closed（竞态窗口）；
  * - `"multi-open"`：上一轮已收尾，最新一轮还在跑、连 end 都没有。
  */
-function chatSnapshot(reason: string): {
+function chatSnapshot(snapshotKind: string): {
 	timeline: {
 		turnOrder: number[];
 		turns: Map<number, { status: string; end: { data: { reason: { kind: string } } } | undefined }>;
 	};
 } {
-	if (reason === "none") return { timeline: { turnOrder: [], turns: new Map() } };
-	if (reason === "multi") {
+	if (snapshotKind === "none") return { timeline: { turnOrder: [], turns: new Map() } };
+	if (snapshotKind === "multi") {
 		return {
 			timeline: {
 				turnOrder: [1, 2],
@@ -862,7 +862,7 @@ function chatSnapshot(reason: string): {
 			},
 		};
 	}
-	if (reason === "multi-open") {
+	if (snapshotKind === "multi-open") {
 		return {
 			timeline: {
 				turnOrder: [1, 2],
@@ -876,7 +876,7 @@ function chatSnapshot(reason: string): {
 	return {
 		timeline: {
 			turnOrder: [1],
-			turns: new Map([[1, { status: "closed", end: { data: { reason: { kind: reason } } } }]]),
+			turns: new Map([[1, { status: "closed", end: { data: { reason: { kind: snapshotKind } } } }]]),
 		},
 	};
 }
