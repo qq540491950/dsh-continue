@@ -1,0 +1,18 @@
+# 守门员：任何 push（含 tag）都跑一遍与本地完全相同的 npm run check。
+# AGENTS.md 第 8 节的发版纪律由此机器化：忘跑本地自检、tag 指向缺产物或产物过期的提交，
+# 都会在这里变红。单 job、固定 Node 24（工具链依赖 Node 原生类型剥离，低于 24 会挂）、
+# 不做任何发布动作。
+name: check
+
+on: push
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm install
+      - run: npm run check
