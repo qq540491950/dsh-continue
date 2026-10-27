@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Continue">
+  <!--
+    bundle 卡片图标（`package.json` 的顶层 `icon` 指向本文件）：插件页里这一行的方块插画。
+
+    为什么这样画（与 dsh-mcp-manager / dsh-skill-manager / dsh-hooks 的图标同一套规格）：
+      1. 64x64 画布 + `<rect rx="14">` 圆角底色块 + 纯白墨迹。静态图标以 `<img>` 进 DOM，
+         拿不到页面 CSS，**不能用 `currentColor`**（它会退化成初始黑，深色主题下几乎看不见）。
+      2. 底色 `#3E63DD` 与 MCP / Hooks 图标同色（Skills 是相邻的 `#3B6FE0`）——同一张列表里
+         几个方块看起来是一套。
+      3. 图形语义就是本插件在做的事：**一个播放三角 + 两粒向后延伸的点**——「接着往下跑、
+         后面还有输出」，对应「异常结束 / 被停止 / 输出被截断后一键继续」。三角沿用 composer
+         上那枚继续键的形状（官方 `IconPlayOutlineRegular` 的轮廓语义），卡片与按钮一眼同源。
+  -->
+  <rect x="0" y="0" width="64" height="64" rx="14" fill="#3E63DD"/>
+  <!-- 播放三角：描边与填充同色，只为 `stroke-linejoin="round"` 把三个尖角磨圆 -->
+  <path d="M15 15.5 L37 32 L15 48.5 Z" fill="#FFFFFF" stroke="#FFFFFF" stroke-width="4" stroke-linejoin="round" stroke-linecap="round"/>
+  <!-- 两粒「还有下一段」的点，直径与三角笔画同宽，越靠右越轻 -->
+  <circle cx="44.5" cy="32" r="2.9" fill="#FFFFFF"/>
+  <circle cx="52" cy="32" r="2.9" fill="#FFFFFF"/>
+</svg>

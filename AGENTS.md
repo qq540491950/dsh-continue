@@ -23,6 +23,7 @@ DSH 桌面端（Web GUI）的**纯客户端**插件：composer 的主操作按�
 | `tsconfig.tools.json` | `tools/*.ts` 的类型检查配置（`noEmit` + `erasableSyntaxOnly` + `types: ["node"]`），保证这些脚本能被 Node **原生类型剥离**直接执行 | 中——写成 `enum` / `namespace` / 参数属性等不可擦除语法，`node tools/*.ts` 会直接报错 |
 | `tools/build.ts` | 构建：`src/` → `.build/` → 校验投递契约 → **临时文件 + 原子替换**进 `lib/`（2.4） | 中——绕过它手写 `lib/` 就是复活 2.4 的半截文件事故 |
 | `package.json` | 包清单契约（第 4 节） | 中——改错就整体不加载 |
+| `assets/icon.svg` | 插件页那一行的方块插画（`package.json` 顶层 `icon` 指向它，`files` 负责带进包）。64×64 + `rx="14"` 圆角底 + 纯白墨迹，与 dsh-mcp-manager / dsh-skill-manager / dsh-hooks 同一套规格 | 低——但**别改成 `currentColor`**：静态图标以 `<img>` 进 DOM，拿不到 CSS，深色主题下会糊成一片 |
 | `cordis.patch.yml` | 包自带的补丁层：bundle 形态的接线行（`package.json` 的 `dsh.bundle.patch` 指向它，GUI「添加插件」/`plugin_manager.install_bundle` 安装时读它） | 中——`insert` 行的 `id` / `name` 都必须等于包名；裸写顶层 `- id: X` 会变成"覆写不存在的条目"而被 Loader 丢弃 |
 | `tools/verify.ts` | 离线自检：纯 Node、零依赖，用 `node:vm` 跑**真实的** `lib/client.js`（含迷你渲染器 + 假 DOM） | 低；改它必须同步改断言，**不许为了让它变绿而放宽断言** |
 | `tools/asar.ts` | 开发工具：从 `app.asar` 里只读取官方源码（`list` / `read` / `grep`） | 低；不是插件的一部分，不参与投递 |
@@ -115,6 +116,8 @@ DSH 桌面端（Web GUI）的**纯客户端**插件：composer 的主操作按�
 | `lib/client.js` 必须仍是 classic script：无 `import` / `export` 语句、无 `__esModule` / CJS 包装 | 投递链路按 classic script 执行它；一旦 `src/client.ts` 变成 ESM（加了一行 `import`/`export`），`tsc` 会产出模块包装，`window.__ModuleLoader__.load` 不再被调用，插件静默消失 | verify A（`moduleDetection: "legacy"` 是它的前提） |
 | 浏览器半边必须**单文件**（`src/client.ts` 不拆模块） | `require` 只认平台种子模块，相对 `require` 在浏览器里解析不到；拆文件就只能上打包器，多一个失败面 | 人工 + verify C（`require` 面只有 `react`） |
 | 产物必须由 `npm run build` 生成、且不早于源码 | 手写 `lib/` 会绕过 2.4 的原子替换；改了 `src/` 忘了构建则投递的是旧逻辑 | verify A（`__esModule` / 产物新旧两条断言） |
+| 包清单顶层 `icon` 指向 `./assets/icon.svg`，且 `files` 收着 `assets/icon.svg` | 插件页每行显示的方块插画来自**包根清单的 `icon`**（宿主转成 data URL 交给 `<img>`）；缺任一条这一行就退回灰色默认插画，和隔壁几枚图标不成一套——而这类回归**界面上不报错**，只能靠断言守 | verify A（三条断言 + 三条反向验证） |
+| 图标是静态 SVG 资产：`#3E63DD` 写死、属性里不许出现 `currentColor` | 以 `<img>` 渲染，继承不到页面 CSS；`currentColor` 会退化成初始黑 | verify A |
 
 **不要顺手做的重构**：不加运行时依赖、不引入打包器（`tsc` 之外不需要构建工具）、不把
 `src/client.ts` 拆成多文件（它必须编译成一个 classic script，不是 ESM）、不改有意的硬编码、

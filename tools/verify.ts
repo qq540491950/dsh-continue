@@ -28,6 +28,8 @@ const CLIENT_PATH = path.join(ROOT, "lib", "client.js");
 const HOST_PATH = path.join(ROOT, "lib", "index.js");
 const MANIFEST_PATH = path.join(ROOT, "package.json");
 const PATCH_PATH = path.join(ROOT, "cordis.patch.yml");
+/** 插件页那行的方块插画（`package.json` 的顶层 `icon` 指向它，`files` 负责把它带进包）。 */
+const ICON_PATH = path.join(ROOT, "assets", "icon.svg");
 /** TS 工程：源码、工具脚本、tsconfig（lib/*.js 是它们的产物，不许手改）。 */
 const SRC_CLIENT_PATH = path.join(ROOT, "src", "client.ts");
 const SRC_HOST_PATH = path.join(ROOT, "src", "index.ts");
@@ -276,12 +278,14 @@ interface Sources {
 	host: string;
 	bundlePatch: string;
 	manifest: string;
+	icon: string;
 }
 
 /** package.json 里自检关心的字段。 */
 interface Manifest {
 	name: string;
 	main?: string;
+	icon?: string;
 	exports: Record<string, string>;
 	files?: string[];
 	scripts?: Record<string, string>;
@@ -1059,6 +1063,24 @@ async function runSuite(sources: Sources): Promise<{ failures: string[]; passed:
 		`实际 ${JSON.stringify(patchRowName)}`,
 	);
 
+	// 插件页那一行的方块插画：清单里要有 `icon`、文件要在、还要被 `files` 带进包——
+	// 缺任何一条，装进 profile 的行就退回灰色默认插画，和隔壁几枚图标不成一套（v0.2.x 正是如此）。
+	const iconText = sources.icon;
+	ok("A", "清单声明了插件卡片图标（顶层 icon）", manifest.icon === "./assets/icon.svg", `实际 ${JSON.stringify(manifest.icon)}`);
+	ok(
+		"A",
+		"图标文件存在且被 files 收进包",
+		fs.existsSync(ICON_PATH) && iconText !== "" && (manifest.files ?? []).includes("assets/icon.svg"),
+	);
+	ok(
+		"A",
+		"图标是静态资产（64x64 圆角底板 + 写死颜色，属性里不许用 currentColor）",
+		/width="64"[^>]*height="64"/.test(iconText) &&
+			/<rect[^>]*rx="14"[^>]*fill="#3E63DD"/.test(iconText) &&
+			// 只查属性，注释里提到 currentColor 是在解释「为什么不用它」，不算违规。
+			/(?:fill|stroke|style)="[^"]*currentColor/.test(iconText) === false,
+	);
+
 	// ---- A' TS 工程（源码在 src/，投递产物在 lib/，产物由 tools/build.ts 原子替换） ----
 	ok(
 		"A",
@@ -1363,6 +1385,9 @@ const MUTATIONS: Mutation[] = [
 	{ label: "取第一轮而不是最新一轮", file: "client", from: "order[order.length - 1]", to: "order[0]", expect: "还没有 end" },
 	{ label: '清单缺 exports["."]', file: "manifest", from: '".": "./lib/index.js",', to: "", expect: "manifest 引用的文件都存在" },
 	{ label: "客户端投递顺序依赖被删", file: "manifest", from: '"@deepseek-ai/dsh-client-ui-conversation"', to: '"@deepseek-ai/dsh-client-ui-not-a-package"', expect: "投递顺序依赖" },
+	{ label: "清单不再声明卡片图标", file: "manifest", from: '"icon": "./assets/icon.svg",\n', to: "", expect: "清单声明了插件卡片图标" },
+	{ label: "图标没被 files 收进包", file: "manifest", from: '"assets/icon.svg",', to: "", expect: "图标文件存在且被 files 收进包" },
+	{ label: "图标底色改用 currentColor", file: "icon", from: 'fill="#3E63DD"', to: 'fill="currentColor"', expect: "图标是静态资产" },
 ];
 
 /** 跑反向验证，返回逐条结果。 */
@@ -1400,6 +1425,7 @@ const sources: Sources = {
 	host: fs.readFileSync(HOST_PATH, "utf8"),
 	bundlePatch: fs.readFileSync(PATCH_PATH, "utf8"),
 	manifest: fs.readFileSync(MANIFEST_PATH, "utf8"),
+	icon: fs.existsSync(ICON_PATH) ? fs.readFileSync(ICON_PATH, "utf8") : "",
 };
 const suite = await runSuite(sources);
 const mutations = await runMutations(sources);
